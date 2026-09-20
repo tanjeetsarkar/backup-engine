@@ -114,6 +114,8 @@ func runBackup(args []string) error {
 	source := fs.String("source", "", "source file or directory")
 	creds := bindCredentialOptions(fs)
 	tags := fs.String("tags", "DAILY", "comma-separated retention tags")
+	permissionPolicy := fs.String("permission-policy", "", "permission policy for unreadable files: fail or skip (default: fail)")
+	workers := fs.Int("workers", 0, "number of worker goroutines for file preparation (0 = auto)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -141,8 +143,21 @@ func runBackup(args []string) error {
 	}
 	defer eng.Close()
 
+	var options pipeline.BackupOptions
+	if *permissionPolicy != "" {
+		switch *permissionPolicy {
+		case string(pipeline.PermissionPolicyFail):
+			options.PermissionPolicy = pipeline.PermissionPolicyFail
+		case string(pipeline.PermissionPolicySkip):
+			options.PermissionPolicy = pipeline.PermissionPolicySkip
+		default:
+			return fmt.Errorf("invalid permission policy %q: must be 'fail' or 'skip'", *permissionPolicy)
+		}
+	}
+	options.Workers = *workers
+
 	normTags := splitTags(*tags)
-	result, err := eng.BackupPathDetailed(context.Background(), *source, nil, normTags, output.reporter())
+	result, err := eng.BackupPathDetailedWithOptions(context.Background(), *source, nil, normTags, options, output.reporter())
 	if err != nil {
 		return err
 	}
@@ -152,14 +167,21 @@ func runBackup(args []string) error {
 
 	fmt.Printf("snapshot: %x\n", result.SnapshotID)
 	if output.rich() {
-		printSummary("Backup summary",
+		summary := []string{
 			fmt.Sprintf("Files: %d", result.FilesProcessed),
 			fmt.Sprintf("Logical bytes: %d", result.LogicalBytes),
 			fmt.Sprintf("Chunks new/reused: %d/%d", result.ChunksNew, result.ChunksReused),
 			fmt.Sprintf("Packs written: %d", result.PacksWritten),
 			fmt.Sprintf("Stored bytes: %d", result.StoredBytes),
 			fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
-		)
+		}
+		if result.FilesSkipped > 0 {
+			summary = append(summary, fmt.Sprintf("Skipped files: %d", result.FilesSkipped))
+			if result.SkippedBytes > 0 {
+				summary = append(summary, fmt.Sprintf("Skipped bytes: %d", result.SkippedBytes))
+			}
+		}
+		printSummary("Backup summary", summary...)
 	}
 	return nil
 }

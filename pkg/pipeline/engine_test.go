@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/tanjeetsarkar/backup-engine/pkg/index"
+	"github.com/tanjeetsarkar/backup-engine/pkg/manifest"
 	"github.com/tanjeetsarkar/backup-engine/pkg/retention"
 )
 
@@ -158,6 +161,126 @@ func TestBackupDetailedReportsProgressAndDedupMetrics(t *testing.T) {
 	}
 	if second.PacksWritten != 0 || second.StoredBytes != 0 {
 		t.Fatalf("duplicate backup wrote new storage: %+v", second)
+	}
+}
+
+func TestBackupDetailedParallelWorkersPreserveOrderingAndDedup(t *testing.T) {
+	repo := t.TempDir()
+	sourceDir := t.TempDir()
+	content := []byte("shared content for concurrent deduplication")
+	for index := 15; index >= 0; index-- {
+		path := filepath.Join(sourceDir, fmt.Sprintf("file-%02d.txt", index))
+		if err := os.WriteFile(path, content, 0640); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	engine, err := Open(EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	result, err := engine.BackupPathDetailedWithOptions(context.Background(), sourceDir, nil, []string{"DAILY"}, BackupOptions{PermissionPolicy: PermissionPolicyFail, Workers: 4}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Workers != 4 || result.FilesProcessed != 16 || result.ChunksExamined != 16 || result.ChunksNew != 1 || result.ChunksReused != 15 {
+		t.Fatalf("unexpected parallel backup metrics: %+v", result)
+	}
+
+	envelope, found, err := engine.idx.GetSnapshot(result.SnapshotID)
+	if err != nil || !found {
+		t.Fatalf("GetSnapshot found=%t err=%v", found, err)
+	}
+	snapshot, err := manifest.DecryptSnapshotEnvelope(envelope, engine.km)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, len(snapshot.Root.Files))
+	for index, node := range snapshot.Root.Files {
+		paths[index] = node.Path
+	}
+	if !sort.StringsAreSorted(paths) {
+		t.Fatalf("manifest paths are not sorted: %v", paths)
+	}
+}
+
+func TestBackupPermissionPolicyFailAndSkip(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read mode-protected test paths")
+	}
+
+	repo := t.TempDir()
+	sourceDir := t.TempDir()
+	readablePath := filepath.Join(sourceDir, "readable.txt")
+	unreadablePath := filepath.Join(sourceDir, "unreadable.txt")
+	unreadableDir := filepath.Join(sourceDir, "unreadable-dir")
+	if err := os.WriteFile(readablePath, []byte("readable"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unreadablePath, []byte("unreadable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(unreadableDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unreadableDir, "hidden.txt"), []byte("hidden"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadablePath, 0000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unreadableDir, 0000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(unreadablePath, 0600)
+		_ = os.Chmod(unreadableDir, 0700)
+	})
+
+	scan, err := ScanBackupSource(context.Background(), sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.Files) != 1 || len(scan.SkippedItems) != 2 {
+		t.Skipf("filesystem did not enforce test permissions: files=%v skipped=%v", scan.Files, scan.SkippedItems)
+	}
+
+	engine, err := Open(EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	failed, err := engine.BackupPathDetailedWithOptions(context.Background(), sourceDir, nil, nil, BackupOptions{PermissionPolicy: PermissionPolicyFail, Workers: 2}, nil)
+	var permissionErr *PermissionPreflightError
+	if !errors.As(err, &permissionErr) || len(permissionErr.Items) != 2 || failed.FilesSkipped != 2 {
+		t.Fatalf("strict result=%+v error=%v", failed, err)
+	}
+	if snapshots, listErr := engine.idx.ListSnapshotIDs(); listErr != nil || len(snapshots) != 0 {
+		t.Fatalf("strict backup snapshots=%d err=%v", len(snapshots), listErr)
+	}
+	if _, found, journalErr := engine.idx.GetMeta(backupJournalMetaKey); journalErr != nil || found {
+		t.Fatalf("strict backup journal found=%t err=%v", found, journalErr)
+	}
+
+	skipped, err := engine.BackupPathDetailedWithOptions(context.Background(), sourceDir, nil, nil, BackupOptions{PermissionPolicy: PermissionPolicySkip, Workers: 2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped.FilesProcessed != 1 || skipped.FilesSkipped != 2 || len(skipped.SkippedItems) != 2 {
+		t.Fatalf("skip result=%+v", skipped)
+	}
+	restoreDir := t.TempDir()
+	if err := engine.RestoreSnapshot(context.Background(), skipped.SnapshotID, restoreDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, "readable.txt")); err != nil {
+		t.Fatalf("readable file was not restored: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(restoreDir, "unreadable.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreadable file should be absent, err=%v", err)
 	}
 }
 

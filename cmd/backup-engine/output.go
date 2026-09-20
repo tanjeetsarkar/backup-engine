@@ -51,10 +51,23 @@ func writeJSON(value any) error {
 }
 
 func backupJSON(result pipeline.BackupResult) map[string]any {
+	skippedItems := make([]map[string]any, len(result.SkippedItems))
+	for i, item := range result.SkippedItems {
+		skippedItems[i] = map[string]any{
+			"path":      item.Path,
+			"kind":      item.Kind,
+			"operation": item.Operation,
+			"reason":    item.Reason,
+		}
+	}
 	return map[string]any{
 		"snapshot_id":     fmt.Sprintf("%x", result.SnapshotID),
 		"files_scanned":   result.FilesScanned,
 		"files_processed": result.FilesProcessed,
+		"files_skipped":   result.FilesSkipped,
+		"skipped_bytes":   result.SkippedBytes,
+		"skipped_items":   skippedItems,
+		"workers":         result.Workers,
 		"logical_bytes":   result.LogicalBytes,
 		"chunks_examined": result.ChunksExamined,
 		"chunks_new":      result.ChunksNew,

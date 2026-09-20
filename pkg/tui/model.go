@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -98,6 +99,11 @@ type model struct {
 	confirm               confirmForm
 	pendingSnapshotAction string
 	spinner               spinner.Model
+	preflightScan         pipeline.BackupScanResult
+	preflightAction       actionForm
+	preflightCursor       int
+	showSudoCommand       bool
+	sudoCommand           string
 	snapshots             []pipeline.SnapshotDetails
 	snapshotCursor        int
 	snapshotFilter        textinput.Model
@@ -128,6 +134,7 @@ const (
 	modeSnapshots
 	modeSnapshotEdit
 	modeResult
+	modeBackupPreflight
 )
 
 type repositoryContext struct {
@@ -155,6 +162,11 @@ type taskResultMsg struct {
 	snapshots []pipeline.SnapshotDetails
 	history   []pipeline.TransactionLogEntry
 	err       error
+}
+
+type backupPreflightMsg struct {
+	scanResult pipeline.BackupScanResult
+	actionForm actionForm
 }
 
 func newModel(ctx context.Context) model {
@@ -211,7 +223,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeConfirm
 					return m, m.confirm.Init()
 				}
-				return m.startActionOperation()
+				// For backup, run preflight scan first
+				if m.action.kind == actionBackup {
+					return m, m.startBackupPreflight()
+				}
+				model, cmd := m.startActionOperation()
+				return model, cmd
 			}
 			return m, cmd
 		}
@@ -249,6 +266,61 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusOK = true
 				m.status = "Safety profile changed to " + m.safety.String() + "."
 				m.mode = modeNavigate
+			}
+			return m, nil
+		}
+		if m.mode == modeBackupPreflight {
+			switch message.String() {
+			case "esc":
+				m.mode = modeActionForm
+				m.preflightScan = pipeline.BackupScanResult{}
+				m.preflightAction = actionForm{}
+				m.preflightCursor = 0
+				m.showSudoCommand = false
+				m.sudoCommand = ""
+				return m, nil
+			case "up", "k":
+				if !m.showSudoCommand && m.preflightCursor > 0 {
+					m.preflightCursor--
+				}
+				return m, nil
+			case "down", "j":
+				if !m.showSudoCommand && m.preflightCursor < len(m.preflightScan.SkippedItems)-1 {
+					m.preflightCursor++
+				}
+				return m, nil
+			case "enter":
+				if m.showSudoCommand {
+					m.showSudoCommand = false
+					m.sudoCommand = ""
+					return m, nil
+				}
+				// Default action: continue with skip policy
+				m.action = m.preflightAction
+				// Update the permission policy field to "skip"
+				if len(m.action.fields) > 2 {
+					m.action.fields[2].input.SetValue("skip")
+				}
+				m.preflightScan = pipeline.BackupScanResult{}
+				m.preflightAction = actionForm{}
+				m.preflightCursor = 0
+				return m.startActionOperation()
+			case "s":
+				// Show sudo command
+				if !m.showSudoCommand {
+					m.sudoCommand = m.generateSudoCommand()
+					m.showSudoCommand = true
+				}
+				return m, nil
+			case "c":
+				// Cancel
+				m.mode = modeActionForm
+				m.preflightScan = pipeline.BackupScanResult{}
+				m.preflightAction = actionForm{}
+				m.preflightCursor = 0
+				m.showSudoCommand = false
+				m.sudoCommand = ""
+				return m, nil
 			}
 			return m, nil
 		}
@@ -461,6 +533,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.status = message.err.Error()
 		}
+	case backupPreflightMsg:
+		m.preflightScan = message.scanResult
+		m.preflightAction = message.actionForm
+		m.mode = modeBackupPreflight
+		return m, nil
+	case startBackupDirectMsg:
+		m.action = message.action
+		return m.startActionOperation()
 	case snapshotMutationMsg:
 		if message.err != nil {
 			presentation := pipeline.PresentError(message.err)
@@ -533,6 +613,67 @@ func (m model) startActionOperation() (tea.Model, tea.Cmd) {
 	m.operationCancel = cancel
 	m.beginOperation("Preparing operation", events)
 	return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runAction(operationContext, m.context, m.action, events))
+}
+
+func (m model) startBackupPreflight() tea.Cmd {
+	values := m.action.values()
+	sourcePath := expandHome(values[0])
+	m.beginOperation("Scanning source files for permission issues", nil)
+	return func() tea.Msg {
+		engine, err := pipeline.Open(pipeline.EngineConfig{
+			RepoDir:    expandHome(m.context.repo),
+			Passphrase: []byte(m.context.passphrase),
+			Salt:       []byte(m.context.salt),
+		})
+		if err != nil {
+			return taskResultMsg{title: "Could not open repository", err: err}
+		}
+		defer engine.Close()
+
+		scan, err := pipeline.ScanBackupSource(m.ctx, sourcePath)
+		if err != nil {
+			return taskResultMsg{title: "Preflight scan failed", err: err}
+		}
+
+		if len(scan.SkippedItems) == 0 {
+			// No permission issues, proceed directly to backup
+			// We need to return a message that will trigger the backup
+			return startBackupDirectMsg{action: m.action}
+		}
+
+		// Show preflight dialog with skipped items
+		return backupPreflightMsg{scanResult: scan, actionForm: m.action}
+	}
+}
+
+type startBackupDirectMsg struct {
+	action actionForm
+}
+
+func (m model) generateSudoCommand() string {
+	values := m.preflightAction.values()
+	sourcePath := values[0]
+	tags := values[1]
+	policy := "fail"
+	if len(values) > 2 && values[2] != "" {
+		policy = values[2]
+	}
+	workers := "0"
+	if len(values) > 3 && values[3] != "" {
+		workers = values[3]
+	}
+
+	// Build the command using the current executable
+	exe, _ := os.Executable()
+	cmd := fmt.Sprintf("sudo %s backup --repo %s --source %s --passphrase-file <passphrase-file> --salt-file <salt-file> --tags %s --permission-policy %s --workers %s",
+		exe,
+		m.context.repo,
+		sourcePath,
+		tags,
+		policy,
+		workers,
+	)
+	return cmd
 }
 
 func (m model) startSnapshotMutation(action string) (tea.Model, tea.Cmd) {
@@ -648,6 +789,9 @@ func (m model) detailView() string {
 	if m.mode == modeResult {
 		return m.resultView()
 	}
+	if m.mode == modeBackupPreflight {
+		return m.backupPreflightView()
+	}
 
 	title := sectionNames[m.active]
 	description := map[section]string{
@@ -740,6 +884,43 @@ func (m model) resultView() string {
 		lines = append(lines, "", statusLabelStyle.Render("NEXT STEP"), m.result.next)
 	}
 	lines = append(lines, "", mutedStyle.Render("enter/esc return to dashboard"))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (m model) backupPreflightView() string {
+	lines := []string{
+		sectionTitleStyle.Render("Permission Preflight"),
+		warningStyle.Render("Unreadable source entries detected"),
+		"",
+		fmt.Sprintf("Source: %s", m.preflightAction.values()[0]),
+		fmt.Sprintf("Readable files: %d", len(m.preflightScan.Files)),
+		fmt.Sprintf("Unreadable items: %d", len(m.preflightScan.SkippedItems)),
+		"",
+		statusLabelStyle.Render("UNREADABLE ITEMS"),
+	}
+	for index, item := range m.preflightScan.SkippedItems {
+		style := mutedStyle
+		marker := "  "
+		if index == m.preflightCursor {
+			style = accentStyle
+			marker = "> "
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%s (%s): %s", marker, item.Path, item.Kind, item.Reason)))
+	}
+	lines = append(lines, "", statusLabelStyle.Render("ACTIONS"))
+	lines = append(lines, accentStyle.Render("  [Enter] Continue with skip policy (omit unreadable items)"))
+	lines = append(lines, mutedStyle.Render("  [s] Show sudo retry command"))
+	lines = append(lines, mutedStyle.Render("  [c] Cancel backup"))
+	lines = append(lines, mutedStyle.Render("  [Esc] Return to backup form"))
+	if m.showSudoCommand {
+		lines = append(lines, "", statusLabelStyle.Render("SUDO RETRY COMMAND"))
+		lines = append(lines, mutedStyle.Render("Run this command in a terminal to retry with elevated privileges:"))
+		lines = append(lines, "")
+		lines = append(lines, accentStyle.Render(m.sudoCommand))
+		lines = append(lines, "")
+		lines = append(lines, warningStyle.Render("Warning: Running as root may create root-owned repository files."))
+		lines = append(lines, mutedStyle.Render("Press any key to dismiss."))
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 

@@ -9,8 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -158,10 +160,35 @@ func (e *Engine) BackupPath(ctx context.Context, srcPath string, parent *[32]byt
 
 // BackupPathDetailed backs up a path and reports aggregate progress and metrics.
 func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent *[32]byte, tags []string, reporter Reporter) (result BackupResult, err error) {
+	return e.BackupPathDetailedWithOptions(ctx, srcPath, parent, tags, BackupOptions{PermissionPolicy: PermissionPolicyFail}, reporter)
+}
+
+// BackupPathDetailedWithOptions backs up a path using explicit source handling options.
+func (e *Engine) BackupPathDetailedWithOptions(ctx context.Context, srcPath string, parent *[32]byte, tags []string, options BackupOptions, reporter Reporter) (result BackupResult, err error) {
 	started := time.Now()
 	result.RetentionTags = append([]string(nil), tags...)
 	defer func() { e.recordTransaction(OperationBackup, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
+
+	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseScanning, Level: EventInfo, Message: "Scanning source files"})
+	scan, err := ScanBackupSource(ctx, srcPath)
+	if err != nil {
+		return result, err
+	}
+	if options.PermissionPolicy == "" {
+		options.PermissionPolicy = PermissionPolicyFail
+	}
+	if options.PermissionPolicy != PermissionPolicyFail && options.PermissionPolicy != PermissionPolicySkip {
+		return result, fmt.Errorf("invalid permission policy %q", options.PermissionPolicy)
+	}
+	result.Workers = resolveBackupWorkers(options.Workers)
+	result.FilesScanned = int64(len(scan.Files) + len(scan.SkippedItems))
+	result.FilesSkipped = int64(len(scan.SkippedItems))
+	result.SkippedItems = append(result.SkippedItems, scan.SkippedItems...)
+	if len(scan.SkippedItems) > 0 && options.PermissionPolicy == PermissionPolicyFail {
+		return result, &PermissionPreflightError{Items: scan.SkippedItems}
+	}
+
 	lock, err := acquireMutationLock(e.repoDir)
 	if err != nil {
 		return result, err
@@ -188,38 +215,92 @@ func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent 
 		}
 	}()
 
-	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseScanning, Level: EventInfo, Message: "Scanning source files"})
-
-	files, err := collectFilesContext(ctx, srcPath)
-	if err != nil {
-		return result, err
-	}
-	result.FilesScanned = int64(len(files))
 	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventInfo, Message: "Processing files", Total: result.FilesScanned, Unit: "files"})
 
 	builder := pack.NewPackfileBuilder(e.packTargetSize)
 	var pending []pendingChunk
 	cache := make(map[[32]byte][32]byte)
-	fileNodes := make([]*manifest.FileNode, 0, len(files))
-
-	for _, filePath := range files {
-		node, newPending, flushErr := e.backupOneFile(ctx, srcPath, filePath, builder, pending, cache, &result)
-		if flushErr != nil {
-			return result, flushErr
+	fileNodes := make([]*manifest.FileNode, len(scan.Files))
+	fileStorageIDs := make([][][32]byte, len(scan.Files))
+	processingContext, cancelWorkers := context.WithCancel(ctx)
+	events := e.prepareBackupFiles(processingContext, srcPath, scan.Files, result.Workers)
+	var processingErr error
+	for event := range events {
+		if processingErr != nil {
+			continue
 		}
-		fileNodes = append(fileNodes, node)
-		pending = newPending
-		result.FilesProcessed++
-		result.LogicalBytes += node.Size
-		emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventInfo, Message: "Processed source files", Completed: result.FilesProcessed, Total: result.FilesScanned, Unit: "files"})
-
-		if builder.IsFull() {
-			emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
-			if err := e.flushPackDetailed(ctx, builder, pending, &result, &transaction); err != nil {
-				return result, err
+		if event.err != nil {
+			if event.index >= 0 && isPermissionError(event.err) && options.PermissionPolicy == PermissionPolicySkip && len(fileStorageIDs[event.index]) == 0 {
+				item := SkippedItem{Path: event.path, Kind: "file", Operation: event.operation, Reason: event.err.Error()}
+				result.SkippedItems = append(result.SkippedItems, item)
+				result.FilesSkipped++
+				result.SkippedBytes += event.size
+				emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventWarning, Message: "Skipped unreadable source file", Completed: result.FilesProcessed + result.FilesSkipped, Total: result.FilesScanned, Unit: "files"})
+				continue
 			}
-			builder = pack.NewPackfileBuilder(e.packTargetSize)
-			pending = nil
+			processingErr = fmt.Errorf("%s %s: %w", event.operation, event.path, event.err)
+			cancelWorkers()
+			continue
+		}
+		if event.chunk != nil {
+			result.ChunksExamined++
+			sid, found := cache[event.chunk.cid]
+			if !found && (e.dedupFilter == nil || e.dedupFilter.MightContain(event.chunk.cid)) {
+				var lookupErr error
+				sid, found, lookupErr = e.idx.GetStorageID(event.chunk.cid)
+				if lookupErr != nil {
+					processingErr = lookupErr
+					cancelWorkers()
+					continue
+				}
+			}
+			if found {
+				result.ChunksReused++
+				cache[event.chunk.cid] = sid
+				fileStorageIDs[event.index] = append(fileStorageIDs[event.index], sid)
+				continue
+			}
+			if appendErr := builder.Append(event.chunk.storageID, event.chunk.nonce, event.chunk.ciphertext); appendErr != nil {
+				processingErr = appendErr
+				cancelWorkers()
+				continue
+			}
+			pending = append(pending, pendingChunk{CID: event.chunk.cid, StorageID: event.chunk.storageID})
+			result.ChunksNew++
+			cache[event.chunk.cid] = event.chunk.storageID
+			fileStorageIDs[event.index] = append(fileStorageIDs[event.index], event.chunk.storageID)
+			if e.dedupFilter != nil {
+				e.dedupFilter.Add(event.chunk.cid)
+			}
+			if builder.IsFull() {
+				emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
+				if flushErr := e.flushPackDetailed(processingContext, builder, pending, &result, &transaction); flushErr != nil {
+					processingErr = flushErr
+					cancelWorkers()
+					continue
+				}
+				builder = pack.NewPackfileBuilder(e.packTargetSize)
+				pending = nil
+			}
+			continue
+		}
+		if event.node != nil {
+			event.node.StorageIDs = fileStorageIDs[event.index]
+			fileNodes[event.index] = event.node
+			result.FilesProcessed++
+			result.LogicalBytes += event.node.Size
+			emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventInfo, Message: "Processed source files", Completed: result.FilesProcessed + result.FilesSkipped, Total: result.FilesScanned, Unit: "files"})
+		}
+	}
+	cancelWorkers()
+	if processingErr != nil {
+		return result, processingErr
+	}
+
+	orderedNodes := make([]*manifest.FileNode, 0, result.FilesProcessed)
+	for _, node := range fileNodes {
+		if node != nil {
+			orderedNodes = append(orderedNodes, node)
 		}
 	}
 
@@ -234,7 +315,7 @@ func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent 
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	root := &manifest.DirectoryNode{Path: "/", Files: fileNodes}
+	root := &manifest.DirectoryNode{Path: "/", Files: orderedNodes}
 	snapshot, err := manifest.NewSnapshotManifest(parent, root, tags)
 	if err != nil {
 		return result, err
@@ -588,21 +669,104 @@ type backupTransaction struct {
 	newStorageIDs    [][32]byte
 }
 
-func (e *Engine) backupOneFile(
-	ctx context.Context,
-	basePath string,
-	filePath string,
-	builder *pack.PackfileBuilder,
-	pending []pendingChunk,
-	cache map[[32]byte][32]byte,
-	result *BackupResult,
-) (*manifest.FileNode, []pendingChunk, error) {
+type backupFileJob struct {
+	index int
+	path  string
+}
+
+type preparedChunk struct {
+	cid        [32]byte
+	storageID  [32]byte
+	nonce      []byte
+	ciphertext []byte
+}
+
+type backupFileEvent struct {
+	index     int
+	path      string
+	operation string
+	size      int64
+	node      *manifest.FileNode
+	chunk     *preparedChunk
+	err       error
+}
+
+func resolveBackupWorkers(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
+func (e *Engine) prepareBackupFiles(ctx context.Context, basePath string, files []string, workers int) <-chan backupFileEvent {
+	jobs := make(chan backupFileJob)
+	events := make(chan backupFileEvent, workers*2)
+	var workerGroup sync.WaitGroup
+	workerGroup.Add(workers)
+	for range workers {
+		go func() {
+			defer workerGroup.Done()
+			encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+			if err != nil {
+				select {
+				case events <- backupFileEvent{index: -1, operation: "create compressor", err: err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			defer encoder.Close()
+			for job := range jobs {
+				e.prepareBackupFile(ctx, basePath, job, encoder, events)
+				if ctx.Err() != nil {
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for index, path := range files {
+			select {
+			case jobs <- backupFileJob{index: index, path: path}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		workerGroup.Wait()
+		close(events)
+	}()
+	return events
+}
+
+func (e *Engine) prepareBackupFile(ctx context.Context, basePath string, job backupFileJob, encoder *zstd.Encoder, events chan<- backupFileEvent) {
+	send := func(event backupFileEvent) bool {
+		event.index = job.index
+		event.path = job.path
+		select {
+		case events <- event:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	filePath := job.path
 	relPath := filePath
 	if fi, statErr := os.Stat(basePath); statErr == nil && fi.IsDir() {
 		var relErr error
 		relPath, relErr = filepath.Rel(basePath, filePath)
 		if relErr != nil {
-			return nil, pending, relErr
+			send(backupFileEvent{operation: "resolve path", err: relErr})
+			return
 		}
 	}
 	if relPath == "." {
@@ -612,18 +776,24 @@ func (e *Engine) backupOneFile(
 
 	linkInfo, err := os.Lstat(filePath)
 	if err != nil {
-		return nil, pending, err
+		send(backupFileEvent{operation: "inspect", err: err})
+		return
 	}
 	xattrs, err := captureXAttrs(filePath)
 	if err != nil {
-		return nil, pending, err
+		if !isPermissionError(err) {
+			send(backupFileEvent{operation: "read metadata", size: linkInfo.Size(), err: err})
+			return
+		}
+		xattrs = nil
 	}
 	uid, gid := fileOwnership(linkInfo)
 
 	if linkInfo.Mode()&os.ModeSymlink != 0 {
 		target, readErr := os.Readlink(filePath)
 		if readErr != nil {
-			return nil, pending, readErr
+			send(backupFileEvent{operation: "read symlink", err: readErr})
+			return
 		}
 		node := &manifest.FileNode{
 			Path:          relPath,
@@ -634,26 +804,27 @@ func (e *Engine) backupOneFile(
 			SymlinkTarget: target,
 			XAttrs:        xattrs,
 		}
-		return node, pending, nil
+		send(backupFileEvent{node: node})
+		return
 	}
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, pending, err
+		send(backupFileEvent{operation: "open", size: linkInfo.Size(), err: err})
+		return
 	}
 	defer file.Close()
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return nil, pending, err
+		send(backupFileEvent{operation: "inspect open file", size: linkInfo.Size(), err: err})
+		return
 	}
 
 	contentHasher := blake3.New()
 	ch := chunker.NewFastCDC(io.TeeReader(file, contentHasher))
-	storageIDs := make([][32]byte, 0)
-
 	for {
 		if ctx.Err() != nil {
-			return nil, pending, ctx.Err()
+			return
 		}
 
 		piece, err := ch.NextChunk()
@@ -661,51 +832,21 @@ func (e *Engine) backupOneFile(
 			break
 		}
 		if err != nil {
-			return nil, pending, err
+			send(backupFileEvent{operation: "read", size: fileInfo.Size(), err: err})
+			return
 		}
 
 		cid := backupcrypto.ComputeCID(piece.Data)
-		result.ChunksExamined++
-		if sid, ok := cache[cid]; ok {
-			result.ChunksReused++
-			storageIDs = append(storageIDs, sid)
-			continue
-		}
-
-		if e.dedupFilter != nil && !e.dedupFilter.MightContain(cid) {
-			// Definite miss: skip the bbolt read below and go straight to treating this as new.
-		} else {
-			sid, found, err := e.idx.GetStorageID(cid)
-			if err != nil {
-				return nil, pending, err
-			}
-			if found {
-				result.ChunksReused++
-				cache[cid] = sid
-				storageIDs = append(storageIDs, sid)
-				continue
-			}
-		}
-
 		sid := e.km.DeriveStorageID(cid)
 		chunkKey := e.km.DeriveChunkKey(cid)
-
-		compressed := e.compressor.EncodeAll(piece.Data, nil)
+		compressed := encoder.EncodeAll(piece.Data, nil)
 		ciphertext, nonce, err := backupcrypto.EncryptChunk(compressed, chunkKey, sid)
 		if err != nil {
-			return nil, pending, err
+			send(backupFileEvent{operation: "encrypt", size: fileInfo.Size(), err: err})
+			return
 		}
-
-		if err := builder.Append(sid, nonce, ciphertext); err != nil {
-			return nil, pending, err
-		}
-
-		pending = append(pending, pendingChunk{CID: cid, StorageID: sid})
-		result.ChunksNew++
-		cache[cid] = sid
-		storageIDs = append(storageIDs, sid)
-		if e.dedupFilter != nil {
-			e.dedupFilter.Add(cid)
+		if !send(backupFileEvent{chunk: &preparedChunk{cid: cid, storageID: sid, nonce: nonce, ciphertext: ciphertext}}) {
+			return
 		}
 	}
 
@@ -716,13 +857,12 @@ func (e *Engine) backupOneFile(
 		Size:         fileInfo.Size(),
 		Mode:         uint32(fileInfo.Mode().Perm()),
 		ModTimeEpoch: fileInfo.ModTime().Unix(),
-		StorageIDs:   storageIDs,
 		ContentHash:  contentHash,
 		UID:          uid,
 		GID:          gid,
 		XAttrs:       xattrs,
 	}
-	return node, pending, nil
+	send(backupFileEvent{node: node})
 }
 
 func (e *Engine) flushPack(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk) error {
@@ -1045,33 +1185,91 @@ func collectFiles(srcPath string) ([]string, error) {
 }
 
 func collectFilesContext(ctx context.Context, srcPath string) ([]string, error) {
-	info, err := os.Stat(srcPath)
+	scan, err := ScanBackupSource(ctx, srcPath)
+	return scan.Files, err
+}
+
+// PermissionPreflightError reports source entries that require an explicit skip decision.
+type PermissionPreflightError struct {
+	Items []SkippedItem
+}
+
+func (e *PermissionPreflightError) Error() string {
+	return fmt.Sprintf("backup source contains %d unreadable item(s)", len(e.Items))
+}
+
+func (e *PermissionPreflightError) Unwrap() error {
+	return os.ErrPermission
+}
+
+func isPermissionError(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM)
+}
+
+// ScanBackupSource discovers readable source files without modifying the repository.
+func ScanBackupSource(ctx context.Context, srcPath string) (BackupScanResult, error) {
+	var result BackupScanResult
+	info, err := os.Lstat(srcPath)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
 	if !info.IsDir() {
-		return []string{srcPath}, nil
+		if info.Mode().IsRegular() {
+			file, openErr := os.Open(srcPath)
+			if openErr != nil {
+				return result, openErr
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				return result, closeErr
+			}
+		}
+		result.Files = []string{srcPath}
+		return result, nil
 	}
 
-	files := make([]string, 0)
 	err = filepath.WalkDir(srcPath, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if walkErr != nil {
+			if errors.Is(walkErr, os.ErrPermission) || errors.Is(walkErr, syscall.EPERM) {
+				kind := "file"
+				if d == nil || d.IsDir() {
+					kind = "directory"
+				}
+				result.SkippedItems = append(result.SkippedItems, SkippedItem{Path: path, Kind: kind, Operation: "scan", Reason: walkErr.Error()})
+				if kind == "directory" {
+					return fs.SkipDir
+				}
+				return nil
+			}
 			return walkErr
 		}
 		if d.IsDir() {
 			return nil
 		}
-		files = append(files, path)
+		if d.Type().IsRegular() {
+			file, openErr := os.Open(path)
+			if openErr != nil {
+				if isPermissionError(openErr) {
+					result.SkippedItems = append(result.SkippedItems, SkippedItem{Path: path, Kind: "file", Operation: "open", Reason: openErr.Error()})
+					return nil
+				}
+				return openErr
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				return closeErr
+			}
+		}
+		result.Files = append(result.Files, path)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
-	sort.Strings(files)
-	return files, nil
+	sort.Strings(result.Files)
+	sort.Slice(result.SkippedItems, func(i, j int) bool { return result.SkippedItems[i].Path < result.SkippedItems[j].Path })
+	return result, nil
 }

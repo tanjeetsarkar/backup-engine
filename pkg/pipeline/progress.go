@@ -2,6 +2,34 @@ package pipeline
 
 import "time"
 
+// PermissionPolicy controls whether unreadable source entries fail or are omitted from a backup.
+type PermissionPolicy string
+
+const (
+	PermissionPolicyFail PermissionPolicy = "fail"
+	PermissionPolicySkip PermissionPolicy = "skip"
+)
+
+// BackupOptions configures source handling and parallelism for a backup.
+type BackupOptions struct {
+	PermissionPolicy PermissionPolicy
+	Workers          int
+}
+
+// SkippedItem describes a source entry omitted from a backup.
+type SkippedItem struct {
+	Path      string
+	Kind      string
+	Operation string
+	Reason    string
+}
+
+// BackupScanResult describes readable files and source entries that could not be read.
+type BackupScanResult struct {
+	Files        []string
+	SkippedItems []SkippedItem
+}
+
 // Operation identifies a user-facing repository workflow.
 type Operation string
 
@@ -73,6 +101,10 @@ type BackupResult struct {
 	SnapshotID     [32]byte
 	FilesScanned   int64
 	FilesProcessed int64
+	FilesSkipped   int64
+	SkippedBytes   int64
+	SkippedItems   []SkippedItem
+	Workers        int
 	LogicalBytes   int64
 	ChunksExamined int64
 	ChunksNew      int64

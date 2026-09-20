@@ -75,20 +75,42 @@ func runAction(ctx context.Context, repository repositoryContext, form actionFor
 
 			switch kind {
 			case actionBackup:
-				result, err := engine.BackupPathDetailed(ctx, expandHome(values[0]), nil, splitTags(values[1]), reporter)
+				var options pipeline.BackupOptions
+				if len(values) > 2 && values[2] != "" {
+					switch values[2] {
+					case "fail":
+						options.PermissionPolicy = pipeline.PermissionPolicyFail
+					case "skip":
+						options.PermissionPolicy = pipeline.PermissionPolicySkip
+					}
+				}
+				if len(values) > 3 && values[3] != "" {
+					if w, err := strconv.Atoi(values[3]); err == nil {
+						options.Workers = w
+					}
+				}
+				result, err := engine.BackupPathDetailedWithOptions(ctx, expandHome(values[0]), nil, splitTags(values[1]), options, reporter)
+				summary := []string{
+					fmt.Sprintf("Files             %d", result.FilesProcessed),
+					fmt.Sprintf("Logical bytes     %d", result.LogicalBytes),
+					fmt.Sprintf("Chunks new/reused %d / %d", result.ChunksNew, result.ChunksReused),
+					fmt.Sprintf("Packs written     %d", result.PacksWritten),
+					fmt.Sprintf("Stored bytes      %d", result.StoredBytes),
+					fmt.Sprintf("Duration          %s", result.Duration.Round(time.Millisecond)),
+				}
+				if result.FilesSkipped > 0 {
+					summary = append(summary, fmt.Sprintf("Skipped files     %d", result.FilesSkipped))
+					if result.SkippedBytes > 0 {
+						summary = append(summary, fmt.Sprintf("Skipped bytes     %d", result.SkippedBytes))
+					}
+				}
 				return taskResultMsg{
-					title:  "Backup transaction",
-					detail: fmt.Sprintf("Snapshot %x", result.SnapshotID),
-					summary: []string{
-						fmt.Sprintf("Files             %d", result.FilesProcessed),
-						fmt.Sprintf("Logical bytes     %d", result.LogicalBytes),
-						fmt.Sprintf("Chunks new/reused %d / %d", result.ChunksNew, result.ChunksReused),
-						fmt.Sprintf("Packs written     %d", result.PacksWritten),
-						fmt.Sprintf("Stored bytes      %d", result.StoredBytes),
-						fmt.Sprintf("Duration          %s", result.Duration.Round(time.Millisecond)),
-					},
-					next: "Open Snapshots to inspect the new snapshot, then run Health to verify it.",
-					err:  err,
+					title:   "Backup transaction",
+					detail:  fmt.Sprintf("Snapshot %x", result.SnapshotID),
+					summary: summary,
+					next:    "Open Snapshots to inspect the new snapshot, then run Health to verify it.",
+					err:     err,
+					warning: result.FilesSkipped > 0,
 				}
 			case actionRestore:
 				snapshotID, err := parseHexID(values[0])

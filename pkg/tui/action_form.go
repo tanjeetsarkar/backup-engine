@@ -92,6 +92,8 @@ func newActionForm(kind actionKind) actionForm {
 		form.fields = []actionField{
 			makeField("Source path", "File or directory to snapshot. Directories are scanned recursively; the source itself is never modified. Tab completes paths.", "~/Documents", "", true),
 			makeField("Retention tags", "Comma-separated labels stored with the snapshot, such as DAILY or IMPORTANT. These labels describe the snapshot; current GFS cleanup uses snapshot dates.", "DAILY,IMPORTANT", "DAILY", false),
+			makeOptionalField("Permission policy", "How to handle unreadable files: 'fail' aborts the backup, 'skip' omits them and continues. Default: fail.", "fail", "fail"),
+			makeOptionalField("Workers", "Number of worker goroutines for file preparation. 0 = automatic (bounded by CPU cores).", "0", "0"),
 		}
 	case actionRestore:
 		form.title = "Restore snapshot"
@@ -204,6 +206,17 @@ func (f actionForm) validate() error {
 		}
 	}
 	switch f.kind {
+	case actionBackup:
+		policy := strings.ToLower(f.fields[2].input.Value())
+		if policy != "fail" && policy != "skip" {
+			return fmt.Errorf("permission policy must be 'fail' or 'skip'")
+		}
+		workersStr := strings.TrimSpace(f.fields[3].input.Value())
+		if workersStr != "" {
+			if _, err := strconv.Atoi(workersStr); err != nil {
+				return fmt.Errorf("workers must be a non-negative integer")
+			}
+		}
 	case actionRestore:
 		if _, err := parseHexID(f.fields[0].input.Value()); err != nil {
 			return err
@@ -300,10 +313,20 @@ func (f actionForm) preflightLines() []string {
 	values := f.values()
 	switch f.kind {
 	case actionBackup:
+		policy := "fail"
+		if len(values) > 2 && values[2] != "" {
+			policy = values[2]
+		}
+		workers := "auto"
+		if len(values) > 3 && values[3] != "" {
+			workers = values[3]
+		}
 		return []string{
 			"Action       Create encrypted snapshot",
 			"Source       " + values[0],
 			"Retention    " + values[1],
+			"Permission   " + policy,
+			"Workers      " + workers,
 			"Data policy  Existing chunks will be reused",
 		}
 	case actionRestore:
