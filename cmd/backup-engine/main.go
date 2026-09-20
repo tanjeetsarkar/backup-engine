@@ -32,37 +32,37 @@ func main() {
 	switch sub {
 	case "backup":
 		if err := runBackup(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "backup failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "restore":
 		if err := runRestore(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "restore failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "list-snapshots":
 		if err := runListSnapshots(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "list-snapshots failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "gc":
 		if err := runGC(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "gc failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "verify":
 		if err := runVerify(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "verify failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "doctor":
 		if err := runDoctor(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "doctor failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "init":
 		if err := runInit(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "init failed:", err)
+			printOperationError(err)
 			os.Exit(1)
 		}
 	case "tui":
@@ -78,6 +78,7 @@ func main() {
 
 func runBackup(args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	source := fs.String("source", "", "source file or directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
@@ -98,17 +99,31 @@ func runBackup(args []string) error {
 	defer eng.Close()
 
 	normTags := splitTags(*tags)
-	snapshotID, err := eng.BackupPath(context.Background(), *source, nil, normTags)
+	result, err := eng.BackupPathDetailed(context.Background(), *source, nil, normTags, output.reporter())
 	if err != nil {
 		return err
 	}
+	if output.json {
+		return writeJSON(backupJSON(result))
+	}
 
-	fmt.Printf("snapshot: %x\n", snapshotID)
+	fmt.Printf("snapshot: %x\n", result.SnapshotID)
+	if output.rich() {
+		printSummary("Backup summary",
+			fmt.Sprintf("Files: %d", result.FilesProcessed),
+			fmt.Sprintf("Logical bytes: %d", result.LogicalBytes),
+			fmt.Sprintf("Chunks new/reused: %d/%d", result.ChunksNew, result.ChunksReused),
+			fmt.Sprintf("Packs written: %d", result.PacksWritten),
+			fmt.Sprintf("Stored bytes: %d", result.StoredBytes),
+			fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
+		)
+	}
 	return nil
 }
 
 func runRestore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	dest := fs.String("dest", "", "restore destination root")
 	snapshot := fs.String("snapshot", "", "snapshot id (hex)")
@@ -133,11 +148,28 @@ func runRestore(args []string) error {
 	}
 	defer eng.Close()
 
-	return eng.RestoreSnapshot(context.Background(), snapshotID, *dest)
+	result, err := eng.RestoreSnapshotDetailed(context.Background(), snapshotID, *dest, output.reporter())
+	if err != nil {
+		return err
+	}
+	if output.json {
+		return writeJSON(restoreJSON(result))
+	}
+	if output.rich() {
+		printSummary("Restore summary",
+			fmt.Sprintf("Files restored: %d", result.FilesRestored),
+			fmt.Sprintf("Logical bytes: %d", result.LogicalBytes),
+			fmt.Sprintf("Chunks read: %d", result.ChunksRead),
+			fmt.Sprintf("Destination: %s", result.Destination),
+			fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
+		)
+	}
+	return nil
 }
 
 func runListSnapshots(args []string) error {
 	fs := flag.NewFlagSet("list-snapshots", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -162,6 +194,13 @@ func runListSnapshots(args []string) error {
 			return err
 		}
 
+		if output.json {
+			encoded := make([]string, len(ids))
+			for index, id := range ids {
+				encoded[index] = fmt.Sprintf("%x", id)
+			}
+			return writeJSON(encoded)
+		}
 		for _, id := range ids {
 			fmt.Printf("%x\n", id)
 		}
@@ -173,6 +212,13 @@ func runListSnapshots(args []string) error {
 		return err
 	}
 
+	if output.json {
+		encoded := make([]map[string]any, 0, len(statuses))
+		for _, status := range statuses {
+			encoded = append(encoded, map[string]any{"snapshot_id": fmt.Sprintf("%x", status.ID), "readable": status.Readable, "status": status.StatusText})
+		}
+		return writeJSON(encoded)
+	}
 	for _, s := range statuses {
 		fmt.Printf("%x\t%s\n", s.ID, s.StatusText)
 	}
@@ -182,6 +228,7 @@ func runListSnapshots(args []string) error {
 
 func runGC(args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -209,22 +256,35 @@ func runGC(args []string) error {
 	}
 	defer eng.Close()
 
-	purged, err := eng.RunGC(context.Background(), retention.GFSPolicy{
+	result, err := eng.RunGCDetailed(context.Background(), retention.GFSPolicy{
 		KeepDaily:   *keepDaily,
 		KeepWeekly:  *keepWeekly,
 		KeepMonthly: *keepMonthly,
 		KeepYearly:  *keepYearly,
-	}, graceDuration)
+	}, graceDuration, output.reporter())
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("purged-chunks:", purged)
+	if output.json {
+		return writeJSON(gcJSON(result))
+	}
+	fmt.Println("purged-chunks:", result.ChunksPurged)
+	if output.rich() {
+		printSummary("Garbage collection summary",
+			fmt.Sprintf("Snapshots evaluated: %d", result.SnapshotsEvaluated),
+			fmt.Sprintf("Snapshots retained/dropped: %d/%d", result.SnapshotsRetained, result.SnapshotsDropped),
+			fmt.Sprintf("Chunks examined: %d", result.ChunksExamined),
+			fmt.Sprintf("Chunks purged: %d", result.ChunksPurged),
+			fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
+		)
+	}
 	return nil
 }
 
 func runVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -242,16 +302,30 @@ func runVerify(args []string) error {
 	}
 	defer eng.Close()
 
-	if err := eng.Verify(context.Background()); err != nil {
+	result, err := eng.VerifyDetailed(context.Background(), output.reporter())
+	if err != nil {
 		return err
+	}
+	if output.json {
+		return writeJSON(verifyJSON(result))
 	}
 
 	fmt.Println("verify: OK")
+	if output.rich() {
+		printSummary("Verification summary",
+			fmt.Sprintf("Snapshots checked: %d", result.SnapshotsChecked),
+			fmt.Sprintf("Files checked: %d", result.FilesChecked),
+			fmt.Sprintf("Chunks checked: %d", result.ChunksChecked),
+			fmt.Sprintf("Logical bytes: %d", result.LogicalBytes),
+			fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
+		)
+	}
 	return nil
 }
 
 func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -269,16 +343,42 @@ func runDoctor(args []string) error {
 	}
 	defer eng.Close()
 
-	if err := eng.Doctor(context.Background()); err != nil {
+	result, err := eng.DoctorDetailed(context.Background(), output.reporter())
+	if err != nil {
 		return err
 	}
+	if output.json {
+		if err := writeJSON(doctorJSON(result)); err != nil {
+			return err
+		}
+	} else {
+		if len(result.Issues) == 0 {
+			fmt.Println("doctor: healthy")
+		} else {
+			fmt.Printf("doctor: %d issue(s) found\n", len(result.Issues))
+			for _, issue := range result.Issues {
+				fmt.Printf("- %s: %s\n  next: %s\n", issue.Code, issue.Summary, issue.Hint)
+			}
+		}
+		if output.rich() {
+			printSummary("Doctor summary",
+				fmt.Sprintf("Chunk records checked: %d", result.ChunkRecordsChecked),
+				fmt.Sprintf("Snapshots verified: %d", result.Verify.SnapshotsChecked),
+				fmt.Sprintf("Issues: %d", len(result.Issues)),
+				fmt.Sprintf("Duration: %s", result.Duration.Round(time.Millisecond)),
+			)
+		}
+	}
+	if len(result.Issues) > 0 {
+		return fmt.Errorf("repository health checks found %d issue(s)", len(result.Issues))
+	}
 
-	fmt.Println("doctor: healthy")
 	return nil
 }
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	output := bindOutputOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -287,16 +387,23 @@ func runInit(args []string) error {
 		return err
 	}
 
-	if err := pipeline.InitRepository(pipeline.InitConfig{
+	result, err := pipeline.InitRepositoryDetailed(pipeline.InitConfig{
 		RepoDir:      *repo,
 		Passphrase:   []byte(*passphrase),
 		Salt:         []byte(*salt),
 		BindExisting: *bindExisting,
-	}); err != nil {
+	}, output.reporter())
+	if err != nil {
 		return err
+	}
+	if output.json {
+		return writeJSON(map[string]any{"repository": result.Repository, "bound_existing": result.BoundExisting, "key_check_ready": result.KeyCheckReady, "duration_ms": result.Duration.Milliseconds()})
 	}
 
 	fmt.Println("init: OK")
+	if output.rich() {
+		printSummary("Initialization summary", "Repository: "+result.Repository, fmt.Sprintf("Bound existing data: %t", result.BoundExisting), "Key-check metadata: ready", "Duration: "+result.Duration.Round(time.Millisecond).String())
+	}
 	return nil
 }
 

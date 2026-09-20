@@ -109,6 +109,56 @@ func TestBackupDeduplicatesAcrossSnapshots(t *testing.T) {
 	}
 }
 
+func TestBackupDetailedReportsProgressAndDedupMetrics(t *testing.T) {
+	repo := t.TempDir()
+	sourceDir := t.TempDir()
+	content := []byte("repeatable content for detailed backup accounting")
+	if err := os.WriteFile(filepath.Join(sourceDir, "data.txt"), content, 0640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	eng, err := Open(EngineConfig{
+		RepoDir:    repo,
+		Passphrase: []byte("passphrase"),
+		Salt:       []byte("0123456789abcdef"),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer eng.Close()
+
+	events := make([]ProgressEvent, 0)
+	first, err := eng.BackupPathDetailed(context.Background(), sourceDir, nil, []string{"DAILY"}, func(event ProgressEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatalf("BackupPathDetailed first: %v", err)
+	}
+	if first.FilesScanned != 1 || first.FilesProcessed != 1 || first.LogicalBytes != int64(len(content)) {
+		t.Fatalf("unexpected file metrics: %+v", first)
+	}
+	if first.ChunksExamined == 0 || first.ChunksNew != first.ChunksExamined || first.ChunksReused != 0 {
+		t.Fatalf("unexpected first chunk metrics: %+v", first)
+	}
+	if first.PacksWritten == 0 || first.StoredBytes == 0 || first.Duration <= 0 {
+		t.Fatalf("unexpected storage metrics: %+v", first)
+	}
+	if len(events) < 4 || events[0].Phase != PhaseScanning || events[len(events)-1].Phase != PhaseComplete {
+		t.Fatalf("unexpected progress events: %+v", events)
+	}
+
+	second, err := eng.BackupPathDetailed(context.Background(), sourceDir, nil, []string{"DAILY"}, nil)
+	if err != nil {
+		t.Fatalf("BackupPathDetailed second: %v", err)
+	}
+	if second.ChunksExamined == 0 || second.ChunksReused != second.ChunksExamined || second.ChunksNew != 0 {
+		t.Fatalf("unexpected duplicate chunk metrics: %+v", second)
+	}
+	if second.PacksWritten != 0 || second.StoredBytes != 0 {
+		t.Fatalf("duplicate backup wrote new storage: %+v", second)
+	}
+}
+
 func TestVerifyAndDoctorHealthyRepository(t *testing.T) {
 	repo := t.TempDir()
 	sourceDir := t.TempDir()
@@ -138,6 +188,50 @@ func TestVerifyAndDoctorHealthyRepository(t *testing.T) {
 
 	if err := eng.Doctor(context.Background()); err != nil {
 		t.Fatalf("Doctor: %v", err)
+	}
+}
+
+func TestDetailedRestoreVerifyAndDoctorMetrics(t *testing.T) {
+	repo := t.TempDir()
+	sourceDir := t.TempDir()
+	restoreDir := t.TempDir()
+	content := []byte("detailed operation metrics")
+	if err := os.WriteFile(filepath.Join(sourceDir, "metrics.txt"), content, 0640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	eng, err := Open(EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer eng.Close()
+
+	backup, err := eng.BackupPathDetailed(context.Background(), sourceDir, nil, []string{"DAILY"}, nil)
+	if err != nil {
+		t.Fatalf("BackupPathDetailed: %v", err)
+	}
+	restore, err := eng.RestoreSnapshotDetailed(context.Background(), backup.SnapshotID, restoreDir, nil)
+	if err != nil {
+		t.Fatalf("RestoreSnapshotDetailed: %v", err)
+	}
+	if restore.FilesRestored != 1 || restore.LogicalBytes != int64(len(content)) || restore.ChunksRead == 0 {
+		t.Fatalf("unexpected restore metrics: %+v", restore)
+	}
+
+	verify, err := eng.VerifyDetailed(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("VerifyDetailed: %v", err)
+	}
+	if verify.SnapshotsChecked != 1 || verify.FilesChecked != 1 || verify.LogicalBytes != int64(len(content)) || verify.ChunksChecked == 0 {
+		t.Fatalf("unexpected verify metrics: %+v", verify)
+	}
+
+	doctor, err := eng.DoctorDetailed(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DoctorDetailed: %v", err)
+	}
+	if len(doctor.Issues) != 0 || doctor.ChunkRecordsChecked == 0 || doctor.Verify.SnapshotsChecked != 1 {
+		t.Fatalf("unexpected doctor metrics: %+v", doctor)
 	}
 }
 
@@ -186,6 +280,34 @@ func TestRunGCPurgesUnretainedChunks(t *testing.T) {
 	}
 	if len(recordsAfter) != 0 {
 		t.Fatalf("expected all chunk records to be purged, got %d", len(recordsAfter))
+	}
+}
+
+func TestRunGCDetailedReportsRetentionDecisions(t *testing.T) {
+	repo := t.TempDir()
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, "gc-details.txt"), []byte("gc details"), 0640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	eng, err := Open(EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer eng.Close()
+	if _, err := eng.BackupPath(context.Background(), sourceDir, nil, []string{"DAILY"}); err != nil {
+		t.Fatalf("BackupPath: %v", err)
+	}
+
+	result, err := eng.RunGCDetailed(context.Background(), retention.GFSPolicy{}, 0, nil)
+	if err != nil {
+		t.Fatalf("RunGCDetailed: %v", err)
+	}
+	if result.SnapshotsEvaluated != 1 || result.SnapshotsDropped != 1 || result.SnapshotsRetained != 0 {
+		t.Fatalf("unexpected snapshot metrics: %+v", result)
+	}
+	if len(result.Decisions) != 1 || result.Decisions[0].Keep || result.ChunksExamined == 0 || result.ChunksPurged == 0 {
+		t.Fatalf("unexpected GC metrics: %+v", result)
 	}
 }
 

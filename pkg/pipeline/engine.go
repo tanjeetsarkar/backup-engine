@@ -117,12 +117,24 @@ func (e *Engine) Close() error {
 
 // BackupPath backs up a file or directory and commits an encrypted snapshot manifest.
 func (e *Engine) BackupPath(ctx context.Context, srcPath string, parent *[32]byte, tags []string) ([32]byte, error) {
-	var zero [32]byte
+	result, err := e.BackupPathDetailed(ctx, srcPath, parent, tags, nil)
+	return result.SnapshotID, err
+}
+
+// BackupPathDetailed backs up a path and reports aggregate progress and metrics.
+func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent *[32]byte, tags []string, reporter Reporter) (result BackupResult, err error) {
+	started := time.Now()
+	result.RetentionTags = append([]string(nil), tags...)
+	defer func() { result.Duration = time.Since(started) }()
+
+	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseScanning, Level: EventInfo, Message: "Scanning source files"})
 
 	files, err := collectFiles(srcPath)
 	if err != nil {
-		return zero, err
+		return result, err
 	}
+	result.FilesScanned = int64(len(files))
+	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventInfo, Message: "Processing files", Total: result.FilesScanned, Unit: "files"})
 
 	builder := pack.NewPackfileBuilder(e.packTargetSize)
 	var pending []pendingChunk
@@ -130,16 +142,20 @@ func (e *Engine) BackupPath(ctx context.Context, srcPath string, parent *[32]byt
 	fileNodes := make([]*manifest.FileNode, 0, len(files))
 
 	for _, filePath := range files {
-		node, newPending, flushErr := e.backupOneFile(ctx, srcPath, filePath, builder, pending, cache)
+		node, newPending, flushErr := e.backupOneFile(ctx, srcPath, filePath, builder, pending, cache, &result)
 		if flushErr != nil {
-			return zero, flushErr
+			return result, flushErr
 		}
 		fileNodes = append(fileNodes, node)
 		pending = newPending
+		result.FilesProcessed++
+		result.LogicalBytes += node.Size
+		emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseProcessing, Level: EventInfo, Message: "Processed source files", Completed: result.FilesProcessed, Total: result.FilesScanned, Unit: "files"})
 
 		if builder.IsFull() {
-			if err := e.flushPack(ctx, builder, pending); err != nil {
-				return zero, err
+			emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
+			if err := e.flushPackDetailed(ctx, builder, pending, &result); err != nil {
+				return result, err
 			}
 			builder = pack.NewPackfileBuilder(e.packTargetSize)
 			pending = nil
@@ -147,55 +163,77 @@ func (e *Engine) BackupPath(ctx context.Context, srcPath string, parent *[32]byt
 	}
 
 	if len(pending) > 0 {
-		if err := e.flushPack(ctx, builder, pending); err != nil {
-			return zero, err
+		emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
+		if err := e.flushPackDetailed(ctx, builder, pending, &result); err != nil {
+			return result, err
 		}
 	}
 
+	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseCommitting, Level: EventInfo, Message: "Committing snapshot manifest"})
 	root := &manifest.DirectoryNode{Path: "/", Files: fileNodes}
 	snapshot, err := manifest.NewSnapshotManifest(parent, root, tags)
 	if err != nil {
-		return zero, err
+		return result, err
 	}
 	env, err := manifest.EncryptSnapshotEnvelope(snapshot, e.km)
 	if err != nil {
-		return zero, err
+		return result, err
 	}
 	if err := e.idx.PutSnapshot(snapshot.SnapshotID, env); err != nil {
-		return zero, err
+		return result, err
 	}
 
-	return snapshot.SnapshotID, nil
+	result.SnapshotID = snapshot.SnapshotID
+	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseComplete, Level: EventSuccess, Message: "Backup completed", Completed: result.FilesProcessed, Total: result.FilesScanned, Unit: "files"})
+	return result, nil
 }
 
 // RestoreSnapshot restores a stored snapshot into destination root.
 func (e *Engine) RestoreSnapshot(ctx context.Context, snapshotID [32]byte, destRoot string) error {
+	_, err := e.RestoreSnapshotDetailed(ctx, snapshotID, destRoot, nil)
+	return err
+}
+
+// RestoreSnapshotDetailed restores a snapshot and reports aggregate progress and metrics.
+func (e *Engine) RestoreSnapshotDetailed(ctx context.Context, snapshotID [32]byte, destRoot string, reporter Reporter) (result RestoreResult, err error) {
+	started := time.Now()
+	result.SnapshotID = snapshotID
+	result.Destination = destRoot
+	defer func() { result.Duration = time.Since(started) }()
+	emit(reporter, ProgressEvent{Operation: OperationRestore, Phase: PhasePreparing, Level: EventInfo, Message: "Loading snapshot manifest"})
+
 	env, found, err := e.idx.GetSnapshot(snapshotID)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if !found {
-		return fmt.Errorf("snapshot not found")
+		return result, fmt.Errorf("snapshot not found")
 	}
 
 	snapshot, err := manifest.DecryptSnapshotEnvelope(env, e.km)
 	if err != nil {
 		if errors.Is(err, backupcrypto.ErrAuthenticationFailed) {
-			return fmt.Errorf("snapshot metadata authentication failed: likely wrong passphrase/salt for this repository or corrupted snapshot metadata")
+			return result, fmt.Errorf("snapshot metadata authentication failed: likely wrong passphrase/salt for this repository or corrupted snapshot metadata")
 		}
-		return err
+		return result, err
 	}
 	if snapshot.Root == nil {
-		return fmt.Errorf("snapshot root is nil")
+		return result, fmt.Errorf("snapshot root is nil")
 	}
 
+	totalFiles := int64(len(snapshot.Root.Files))
+	emit(reporter, ProgressEvent{Operation: OperationRestore, Phase: PhaseReading, Level: EventInfo, Message: "Restoring files", Total: totalFiles, Unit: "files"})
 	for _, fileNode := range snapshot.Root.Files {
-		if err := e.restoreOneFile(ctx, destRoot, fileNode); err != nil {
-			return err
+		if err := e.restoreOneFileDetailed(ctx, destRoot, fileNode, &result); err != nil {
+			return result, err
 		}
+		result.FilesRestored++
+		result.LogicalBytes += fileNode.Size
+		emit(reporter, ProgressEvent{Operation: OperationRestore, Phase: PhaseReading, Level: EventInfo, Message: "Restored files", Completed: result.FilesRestored, Total: totalFiles, Unit: "files"})
 	}
 
-	return nil
+	emit(reporter, ProgressEvent{Operation: OperationRestore, Phase: PhaseComplete, Level: EventSuccess, Message: "Restore completed", Completed: result.FilesRestored, Total: totalFiles, Unit: "files"})
+	return result, nil
 }
 
 // ListSnapshots returns known snapshot IDs.
@@ -249,16 +287,26 @@ func (e *Engine) ListSnapshotStatuses() ([]SnapshotStatus, error) {
 
 // RunGC applies GFS retention and performs sweep/compaction.
 func (e *Engine) RunGC(ctx context.Context, policy retention.GFSPolicy, graceLimit time.Duration) (int, error) {
+	result, err := e.RunGCDetailed(ctx, policy, graceLimit, nil)
+	return int(result.ChunksPurged), err
+}
+
+// RunGCDetailed applies retention and returns its evaluated decisions and aggregate metrics.
+func (e *Engine) RunGCDetailed(ctx context.Context, policy retention.GFSPolicy, graceLimit time.Duration, reporter Reporter) (result GCResult, err error) {
+	started := time.Now()
+	defer func() { result.Duration = time.Since(started) }()
+	emit(reporter, ProgressEvent{Operation: OperationGC, Phase: PhasePlanning, Level: EventInfo, Message: "Evaluating snapshot retention"})
+
 	ids, err := e.idx.ListSnapshotIDs()
 	if err != nil {
-		return 0, err
+		return result, err
 	}
 
 	manifests := make([]*manifest.SnapshotManifest, 0, len(ids))
 	for _, id := range ids {
 		env, found, getErr := e.idx.GetSnapshot(id)
 		if getErr != nil {
-			return 0, getErr
+			return result, getErr
 		}
 		if !found {
 			continue
@@ -266,23 +314,30 @@ func (e *Engine) RunGC(ctx context.Context, policy retention.GFSPolicy, graceLim
 
 		snap, decErr := manifest.DecryptSnapshotEnvelope(env, e.km)
 		if decErr != nil {
-			return 0, decErr
+			return result, decErr
 		}
 		manifests = append(manifests, snap)
 	}
 
 	classified := retention.EvaluateGFS(manifests, policy)
+	result.SnapshotsEvaluated = int64(len(classified))
 	retained := make([]*manifest.SnapshotManifest, 0, len(classified))
 	for _, item := range classified {
+		decision := RetentionDecision{SnapshotID: item.Manifest.SnapshotID, Keep: item.Keep, Reason: item.Reason}
+		result.Decisions = append(result.Decisions, decision)
 		if item.Keep {
 			retained = append(retained, item.Manifest)
+			result.SnapshotsRetained++
+		} else {
+			result.SnapshotsDropped++
 		}
 	}
 
 	records, err := e.idx.ListChunkRecords()
 	if err != nil {
-		return 0, err
+		return result, err
 	}
+	result.ChunksExamined = int64(len(records))
 	chunks := make([]retention.ChunkLocation, 0, len(records))
 	for _, r := range records {
 		chunks = append(chunks, retention.ChunkLocation{
@@ -295,101 +350,153 @@ func (e *Engine) RunGC(ctx context.Context, policy retention.GFSPolicy, graceLim
 	}
 
 	gc := retention.NewGarbageCollector(e.storage, e.idx, graceLimit)
-	return gc.Run(ctx, retained, chunks)
+	emit(reporter, ProgressEvent{Operation: OperationGC, Phase: PhaseCompacting, Level: EventInfo, Message: "Sweeping unreferenced chunks", Total: result.ChunksExamined, Unit: "chunks"})
+	purged, err := gc.Run(ctx, retained, chunks)
+	result.ChunksPurged = int64(purged)
+	if err != nil {
+		return result, err
+	}
+	emit(reporter, ProgressEvent{Operation: OperationGC, Phase: PhaseComplete, Level: EventSuccess, Message: "Garbage collection completed", Completed: result.ChunksPurged, Unit: "chunks"})
+	return result, nil
 }
 
 // Verify validates that all snapshots are decryptable and all referenced data chunks are readable/authentic.
 func (e *Engine) Verify(ctx context.Context) error {
+	_, err := e.VerifyDetailed(ctx, nil)
+	return err
+}
+
+// VerifyDetailed validates repository data and reports aggregate progress and metrics.
+func (e *Engine) VerifyDetailed(ctx context.Context, reporter Reporter) (result VerifyResult, err error) {
+	started := time.Now()
+	defer func() { result.Duration = time.Since(started) }()
+	emit(reporter, ProgressEvent{Operation: OperationVerify, Phase: PhasePreparing, Level: EventInfo, Message: "Loading snapshot catalog"})
+
 	ids, err := e.idx.ListSnapshotIDs()
 	if err != nil {
-		return err
+		return result, err
 	}
+	totalSnapshots := int64(len(ids))
+	emit(reporter, ProgressEvent{Operation: OperationVerify, Phase: PhaseChecking, Level: EventInfo, Message: "Checking snapshots and referenced data", Total: totalSnapshots, Unit: "snapshots"})
 
 	for _, id := range ids {
 		env, found, getErr := e.idx.GetSnapshot(id)
 		if getErr != nil {
-			return getErr
+			return result, getErr
 		}
 		if !found {
-			return fmt.Errorf("snapshot disappeared during verify")
+			return result, fmt.Errorf("snapshot disappeared during verify")
 		}
 
 		snap, decErr := manifest.DecryptSnapshotEnvelope(env, e.km)
 		if decErr != nil {
-			return fmt.Errorf("snapshot %x decrypt failed: %w", id, decErr)
+			return result, fmt.Errorf("snapshot %x decrypt failed: %w", id, decErr)
 		}
 		if snap.Root == nil {
-			return fmt.Errorf("snapshot %x has nil root", id)
+			return result, fmt.Errorf("snapshot %x has nil root", id)
 		}
 
 		for _, fileNode := range snap.Root.Files {
-			if _, matErr := e.materializeFileContent(ctx, fileNode); matErr != nil {
-				return fmt.Errorf("snapshot %x file %s verify failed: %w", id, fileNode.Path, matErr)
+			if _, matErr := e.materializeFileContentDetailed(ctx, fileNode, func() { result.ChunksChecked++ }); matErr != nil {
+				return result, fmt.Errorf("snapshot %x file %s verify failed: %w", id, fileNode.Path, matErr)
 			}
+			result.FilesChecked++
+			result.LogicalBytes += fileNode.Size
 		}
+		result.SnapshotsChecked++
+		emit(reporter, ProgressEvent{Operation: OperationVerify, Phase: PhaseChecking, Level: EventInfo, Message: "Checked snapshots", Completed: result.SnapshotsChecked, Total: totalSnapshots, Unit: "snapshots"})
 	}
 
-	return nil
+	emit(reporter, ProgressEvent{Operation: OperationVerify, Phase: PhaseComplete, Level: EventSuccess, Message: "Verification completed", Completed: result.SnapshotsChecked, Total: totalSnapshots, Unit: "snapshots"})
+	return result, nil
 }
 
 // Doctor runs consistency checks on index and snapshot references.
 func (e *Engine) Doctor(ctx context.Context) error {
-	issues := make([]string, 0)
+	result, err := e.DoctorDetailed(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if len(result.Issues) == 0 {
+		return nil
+	}
+	messages := make([]string, 0, len(result.Issues))
+	for _, issue := range result.Issues {
+		messages = append(messages, issue.Summary)
+	}
+	return errors.New(strings.Join(messages, "; "))
+}
+
+// DoctorDetailed checks index and data consistency and returns structured issues.
+func (e *Engine) DoctorDetailed(ctx context.Context, reporter Reporter) (result DoctorResult, err error) {
+	started := time.Now()
+	defer func() { result.Duration = time.Since(started) }()
+	emit(reporter, ProgressEvent{Operation: OperationDoctor, Phase: PhaseChecking, Level: EventInfo, Message: "Checking chunk index and pack records"})
 
 	records, err := e.idx.ListChunkRecords()
 	if err != nil {
-		return err
+		return result, err
 	}
 
 	for _, r := range records {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return result, ctx.Err()
 		}
+		result.ChunkRecordsChecked++
 
 		cid, found, getErr := e.idx.GetCID(r.StorageID)
 		if getErr != nil {
-			issues = append(issues, fmt.Sprintf("storage %x reverse cid lookup error: %v", r.StorageID, getErr))
+			result.Issues = append(result.Issues, doctorIssue("reverse-lookup", r.StorageID, "Reverse chunk lookup failed", getErr.Error(), "Run doctor again; restore the repository index from a known-good copy if the error persists."))
 			continue
 		}
 		if !found {
-			issues = append(issues, fmt.Sprintf("storage %x missing reverse cid mapping", r.StorageID))
+			result.Issues = append(result.Issues, doctorIssue("missing-reverse-mapping", r.StorageID, "Chunk is missing its reverse CID mapping", "", "Restore the index from a known-good copy before running garbage collection."))
 			continue
 		}
 
 		sid, found, getErr := e.idx.GetStorageID(cid)
 		if getErr != nil {
-			issues = append(issues, fmt.Sprintf("cid %x forward lookup error: %v", cid, getErr))
+			result.Issues = append(result.Issues, doctorIssue("forward-lookup", r.StorageID, "Forward chunk lookup failed", getErr.Error(), "Run doctor again; restore the repository index if the error persists."))
 			continue
 		}
 		if !found || sid != r.StorageID {
-			issues = append(issues, fmt.Sprintf("cid %x and storage %x mapping mismatch", cid, r.StorageID))
+			result.Issues = append(result.Issues, doctorIssue("mapping-mismatch", r.StorageID, "CID and storage mappings do not agree", "", "Do not run garbage collection until the index is repaired."))
 		}
 
 		raw, readErr := e.storage.GetChunkRange(ctx, r.Location.PackID, int64(r.Location.Offset), pack.RecordSizeFromCipherLen(r.Location.Length))
 		if readErr != nil {
-			issues = append(issues, fmt.Sprintf("storage %x unreadable pack record: %v", r.StorageID, readErr))
+			result.Issues = append(result.Issues, doctorIssue("unreadable-record", r.StorageID, "Pack record cannot be read", readErr.Error(), "Check repository permissions and storage integrity, then run verify."))
 			continue
 		}
 
 		recSID, _, _, decErr := pack.DecodeChunkRecord(raw)
 		if decErr != nil {
-			issues = append(issues, fmt.Sprintf("storage %x decode error: %v", r.StorageID, decErr))
+			result.Issues = append(result.Issues, doctorIssue("record-decode", r.StorageID, "Pack record cannot be decoded", decErr.Error(), "Restore the affected pack from another repository copy."))
 			continue
 		}
 		if recSID != r.StorageID {
-			issues = append(issues, fmt.Sprintf("storage %x record sid mismatch", r.StorageID))
+			result.Issues = append(result.Issues, doctorIssue("storage-id-mismatch", r.StorageID, "Pack record storage ID does not match the index", "", "Restore the affected pack and index from a consistent copy."))
 		}
 	}
 
-	if verr := e.Verify(ctx); verr != nil {
-		issues = append(issues, "verify failed: "+verr.Error())
+	verify, verifyErr := e.VerifyDetailed(ctx, reporter)
+	result.Verify = verify
+	if verifyErr != nil {
+		result.Issues = append(result.Issues, DoctorIssue{Code: "verify-failed", Severity: "error", Summary: "Repository verification failed", Detail: verifyErr.Error(), Hint: "Inspect the failing snapshot or pack and restore it from another repository copy."})
 	}
 
-	if len(issues) > 0 {
-		return errors.New(strings.Join(issues, "; "))
+	level := EventSuccess
+	message := "Repository health checks completed"
+	if len(result.Issues) > 0 {
+		level = EventWarning
+		message = "Repository health checks found issues"
 	}
+	emit(reporter, ProgressEvent{Operation: OperationDoctor, Phase: PhaseComplete, Level: level, Message: message, Completed: result.ChunkRecordsChecked, Total: int64(len(records)), Unit: "records"})
+	return result, nil
+}
 
-	return nil
+func doctorIssue(code string, storageID [32]byte, summary, detail, hint string) DoctorIssue {
+	return DoctorIssue{Code: code, Severity: "error", Resource: fmt.Sprintf("%x", storageID), Summary: summary, Detail: detail, Hint: hint}
 }
 
 type pendingChunk struct {
@@ -404,6 +511,7 @@ func (e *Engine) backupOneFile(
 	builder *pack.PackfileBuilder,
 	pending []pendingChunk,
 	cache map[[32]byte][32]byte,
+	result *BackupResult,
 ) (*manifest.FileNode, []pendingChunk, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -439,7 +547,9 @@ func (e *Engine) backupOneFile(
 		}
 
 		cid := backupcrypto.ComputeCID(piece.Data)
+		result.ChunksExamined++
 		if sid, ok := cache[cid]; ok {
+			result.ChunksReused++
 			storageIDs = append(storageIDs, sid)
 			continue
 		}
@@ -449,6 +559,7 @@ func (e *Engine) backupOneFile(
 			return nil, pending, err
 		}
 		if found {
+			result.ChunksReused++
 			cache[cid] = sid
 			storageIDs = append(storageIDs, sid)
 			continue
@@ -468,6 +579,7 @@ func (e *Engine) backupOneFile(
 		}
 
 		pending = append(pending, pendingChunk{CID: cid, StorageID: sid})
+		result.ChunksNew++
 		cache[cid] = sid
 		storageIDs = append(storageIDs, sid)
 	}
@@ -489,6 +601,10 @@ func (e *Engine) backupOneFile(
 }
 
 func (e *Engine) flushPack(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk) error {
+	return e.flushPackDetailed(ctx, builder, pending, nil)
+}
+
+func (e *Engine) flushPackDetailed(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk, result *BackupResult) error {
 	if len(pending) == 0 {
 		return nil
 	}
@@ -503,6 +619,10 @@ func (e *Engine) flushPack(ctx context.Context, builder *pack.PackfileBuilder, p
 
 	if err := e.storage.PutPack(ctx, packID, bytes.NewReader(packBytes), int64(len(packBytes))); err != nil {
 		return err
+	}
+	if result != nil {
+		result.PacksWritten++
+		result.StoredBytes += int64(len(packBytes))
 	}
 
 	now := time.Now().Unix()
@@ -525,6 +645,10 @@ func (e *Engine) flushPack(ctx context.Context, builder *pack.PackfileBuilder, p
 }
 
 func (e *Engine) restoreOneFile(ctx context.Context, destRoot string, fileNode *manifest.FileNode) error {
+	return e.restoreOneFileDetailed(ctx, destRoot, fileNode, nil)
+}
+
+func (e *Engine) restoreOneFileDetailed(ctx context.Context, destRoot string, fileNode *manifest.FileNode, result *RestoreResult) error {
 	if fileNode == nil {
 		return nil
 	}
@@ -541,7 +665,11 @@ func (e *Engine) restoreOneFile(ctx context.Context, destRoot string, fileNode *
 	}
 	defer f.Close()
 
-	content, err := e.materializeFileContent(ctx, fileNode)
+	content, err := e.materializeFileContentDetailed(ctx, fileNode, func() {
+		if result != nil {
+			result.ChunksRead++
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -558,6 +686,10 @@ func (e *Engine) restoreOneFile(ctx context.Context, destRoot string, fileNode *
 }
 
 func (e *Engine) materializeFileContent(ctx context.Context, fileNode *manifest.FileNode) ([]byte, error) {
+	return e.materializeFileContentDetailed(ctx, fileNode, nil)
+}
+
+func (e *Engine) materializeFileContentDetailed(ctx context.Context, fileNode *manifest.FileNode, chunkRead func()) ([]byte, error) {
 	if fileNode == nil {
 		return nil, nil
 	}
@@ -609,6 +741,9 @@ func (e *Engine) materializeFileContent(ctx context.Context, fileNode *manifest.
 		}
 
 		content = append(content, plain...)
+		if chunkRead != nil {
+			chunkRead()
+		}
 	}
 
 	gotHash := backupcrypto.ComputeCID(content)

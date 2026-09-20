@@ -12,6 +12,8 @@ import (
 
 type safetyProfile int
 
+const confirmationInputDescription = "This phrase prevents an accidental destructive action. The comparison is case-insensitive; no repository credential is requested here."
+
 const (
 	safetyStrict safetyProfile = iota
 	safetyStandard
@@ -97,6 +99,7 @@ func (form confirmForm) View() string {
 		form.reason,
 		"",
 		fmt.Sprintf("Type %s to continue:", accentStyle.Render(form.phrase)),
+		descriptionStyle.Render(confirmationInputDescription),
 		lipgloss.NewStyle().Width(32).Border(lipgloss.RoundedBorder()).BorderForeground(warningColor).Padding(0, 1).Render(form.input.View()),
 	}
 	if form.errorText != "" {

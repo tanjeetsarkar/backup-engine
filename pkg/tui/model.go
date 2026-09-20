@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -19,6 +20,7 @@ type section int
 
 const (
 	sectionOverview section = iota
+	sectionActivity
 	sectionContext
 	sectionBackup
 	sectionRestore
@@ -30,6 +32,7 @@ const (
 
 var sectionNames = []string{
 	"Overview",
+	"Activity",
 	"Repository",
 	"Backup",
 	"Restore",
@@ -38,6 +41,9 @@ var sectionNames = []string{
 	"Retention",
 	"Setup",
 }
+
+const snapshotFilterDescription = "Matches the loaded catalog by any part of a snapshot ID or status such as ok or auth-failed. Filtering does not change repository data."
+const formContentWidth = 46
 
 type keyMap struct {
 	Up     key.Binding
@@ -68,26 +74,32 @@ func (k keyMap) FullHelp() [][]key.Binding {
 }
 
 type model struct {
-	ctx            context.Context
-	active         section
-	mode           viewMode
-	width          int
-	height         int
-	help           help.Model
-	keys           keyMap
-	showHelp       bool
-	context        repositoryContext
-	form           contextForm
-	action         actionForm
-	confirm        confirmForm
-	spinner        spinner.Model
-	snapshots      []pipeline.SnapshotStatus
-	snapshotCursor int
-	snapshotFilter textinput.Model
-	filtering      bool
-	status         string
-	statusOK       bool
-	safety         safetyProfile
+	ctx             context.Context
+	active          section
+	mode            viewMode
+	width           int
+	height          int
+	help            help.Model
+	keys            keyMap
+	showHelp        bool
+	context         repositoryContext
+	form            contextForm
+	action          actionForm
+	confirm         confirmForm
+	spinner         spinner.Model
+	snapshots       []pipeline.SnapshotStatus
+	snapshotCursor  int
+	snapshotFilter  textinput.Model
+	filtering       bool
+	status          string
+	statusOK        bool
+	safety          safetyProfile
+	progress        pipeline.ProgressEvent
+	activity        []pipeline.ProgressEvent
+	progressStream  <-chan tea.Msg
+	operationStart  time.Time
+	operationCancel context.CancelFunc
+	result          taskResultMsg
 }
 
 type viewMode int
@@ -99,6 +111,7 @@ const (
 	modeConfirm
 	modeBusy
 	modeSnapshots
+	modeResult
 )
 
 type repositoryContext struct {
@@ -112,6 +125,9 @@ type contextValidatedMsg struct{ err error }
 type taskResultMsg struct {
 	title     string
 	detail    string
+	summary   []string
+	next      string
+	warning   bool
 	snapshots []pipeline.SnapshotStatus
 	err       error
 }
@@ -133,6 +149,13 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.Width = message.Width
 	case tea.KeyMsg:
 		if message.String() == "ctrl+c" {
+			if m.mode == modeBusy && m.operationCancel != nil {
+				m.operationCancel()
+				m.operationCancel = nil
+				m.status = "Cancelling operation..."
+				m.progress.Message = m.status
+				return m, nil
+			}
 			return m, tea.Quit
 		}
 		if m.mode == modeContextForm {
@@ -144,8 +167,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.form, cmd = m.form.Update(message)
 			if m.form.submitted {
 				m.context = m.form.Value()
-				m.mode = modeBusy
-				m.status = "Validating repository key..."
+				m.beginOperation("Validating repository key", nil)
 				return m, validateRepository(m.context)
 			}
 			return m, cmd
@@ -163,9 +185,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeConfirm
 					return m, m.confirm.Init()
 				}
-				m.mode = modeBusy
-				m.status = "Working..."
-				return m, tea.Batch(m.spinner.Tick, runAction(m.ctx, m.context, m.action))
+				return m.startActionOperation()
 			}
 			return m, cmd
 		}
@@ -178,9 +198,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.confirm, cmd = m.confirm.Update(message)
 			if m.confirm.confirmed {
-				m.mode = modeBusy
-				m.status = "Working..."
-				return m, tea.Batch(m.spinner.Tick, runAction(m.ctx, m.context, m.action))
+				return m.startActionOperation()
 			}
 			return m, cmd
 		}
@@ -227,6 +245,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeBusy {
 			return m, nil
 		}
+		if m.mode == modeResult {
+			if message.String() == "esc" || message.String() == "enter" {
+				m.mode = modeNavigate
+			}
+			return m, nil
+		}
 		switch {
 		case key.Matches(message, m.keys.Quit):
 			return m, tea.Quit
@@ -264,7 +288,17 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			case sectionSnapshots:
 				return m.startTask("Loading snapshots...", loadSnapshots(m.context))
 			case sectionHealth:
-				return m.startTask("Running repository checks...", runHealth(m.ctx, m.context))
+				if m.context.repo == "" {
+					m.active = sectionContext
+					m.statusOK = false
+					m.status = "Connect a repository first."
+					return m, nil
+				}
+				events := make(chan tea.Msg, 64)
+				operationContext, cancel := context.WithCancel(m.ctx)
+				m.operationCancel = cancel
+				m.beginOperation("Preparing repository health checks", events)
+				return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runHealth(operationContext, m.context, events))
 			case sectionOverview:
 				m.active = sectionContext
 				m.form = newContextForm(m.context)
@@ -278,6 +312,18 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.spinner, cmd = m.spinner.Update(message)
 			return m, cmd
 		}
+	case progressEventMsg:
+		m.progress = message.event
+		m.status = message.event.Message
+		m.activity = append(m.activity, message.event)
+		if len(m.activity) > 200 {
+			m.activity = append([]pipeline.ProgressEvent(nil), m.activity[len(m.activity)-200:]...)
+		}
+		if m.mode == modeBusy && m.progressStream != nil {
+			return m, waitForProgress(m.progressStream)
+		}
+	case progressStreamClosedMsg:
+		m.progressStream = nil
 	case contextValidatedMsg:
 		m.mode = modeNavigate
 		m.active = sectionContext
@@ -293,10 +339,19 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = message.err.Error()
 		}
 	case taskResultMsg:
-		m.statusOK = message.err == nil
+		if m.operationCancel != nil {
+			m.operationCancel()
+			m.operationCancel = nil
+		}
+		m.statusOK = message.err == nil && !message.warning
+		m.result = message
 		if message.err != nil {
-			m.status = message.title + ": " + message.err.Error()
-			m.mode = modeNavigate
+			presentation := pipeline.PresentError(message.err)
+			m.result.title = presentation.Summary
+			m.result.detail = presentation.Cause
+			m.result.next = presentation.Hint
+			m.status = presentation.Summary
+			m.mode = modeResult
 			return m, nil
 		}
 		m.status = message.detail
@@ -308,10 +363,30 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.snapshotFilter.Placeholder = "filter by ID or status"
 			m.mode = modeSnapshots
 		} else {
-			m.mode = modeNavigate
+			m.mode = modeResult
+		}
+		if m.progressStream != nil {
+			return m, waitForProgress(m.progressStream)
 		}
 	}
 	return m, nil
+}
+
+func (m model) startActionOperation() (tea.Model, tea.Cmd) {
+	events := make(chan tea.Msg, 64)
+	operationContext, cancel := context.WithCancel(m.ctx)
+	m.operationCancel = cancel
+	m.beginOperation("Preparing operation", events)
+	return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runAction(operationContext, m.context, m.action, events))
+}
+
+func (m *model) beginOperation(status string, events <-chan tea.Msg) {
+	m.mode = modeBusy
+	m.status = status
+	m.progress = pipeline.ProgressEvent{Message: status, Phase: pipeline.PhasePreparing, Time: time.Now()}
+	m.progressStream = events
+	m.operationStart = time.Now()
+	m.result = taskResultMsg{}
 }
 
 func (m model) startTask(label string, command tea.Cmd) (tea.Model, tea.Cmd) {
@@ -321,8 +396,7 @@ func (m model) startTask(label string, command tea.Cmd) (tea.Model, tea.Cmd) {
 		m.status = "Connect a repository first."
 		return m, nil
 	}
-	m.mode = modeBusy
-	m.status = label
+	m.beginOperation(label, nil)
 	return m, tea.Batch(m.spinner.Tick, command)
 }
 
@@ -387,15 +461,19 @@ func (m model) detailView() string {
 		return m.confirm.View()
 	}
 	if m.mode == modeBusy {
-		return lipgloss.JoinVertical(lipgloss.Left, sectionTitleStyle.Render(sectionNames[m.active]), "", accentStyle.Render(m.spinner.View()+" "+m.status), "", mutedStyle.Render("ctrl+c cancels the interface"))
+		return m.busyView()
 	}
 	if m.mode == modeSnapshots {
 		return m.snapshotsView()
+	}
+	if m.mode == modeResult {
+		return m.resultView()
 	}
 
 	title := sectionNames[m.active]
 	description := map[section]string{
 		sectionOverview:  "Repository status and the next useful action at a glance.",
+		sectionActivity:  "Review progress and results from this TUI session.",
 		sectionContext:   "Connect to a repository and validate its encryption key.",
 		sectionBackup:    "Create a deduplicated, encrypted snapshot.",
 		sectionRestore:   "Recover a snapshot into a chosen destination.",
@@ -404,6 +482,9 @@ func (m model) detailView() string {
 		sectionRetention: "Apply retention policy and compact unreferenced data.",
 		sectionSetup:     "Initialize a new repository or bind key-check metadata.",
 	}[m.active]
+	if m.active == sectionActivity {
+		return m.activityView()
+	}
 
 	contextStatus := warningStyle.Render("Not configured")
 	if m.context.repo != "" {
@@ -429,10 +510,82 @@ func (m model) detailView() string {
 	)
 }
 
+func (m model) busyView() string {
+	event := m.progress
+	elapsed := time.Since(m.operationStart).Round(time.Second)
+	operationName := string(event.Operation)
+	if operationName == "" {
+		operationName = "Operation"
+	} else {
+		operationName = strings.ToUpper(operationName[:1]) + operationName[1:]
+	}
+	lines := []string{
+		sectionTitleStyle.Render(operationName + " in progress"),
+		mutedStyle.Render(fmt.Sprintf("Phase: %s  Elapsed: %s", event.Phase, elapsed)),
+		"",
+		accentStyle.Render(m.spinner.View() + " " + event.Message),
+	}
+	if event.Total > 0 {
+		percent := float64(event.Completed) / float64(event.Total) * 100
+		lines = append(lines, fmt.Sprintf("%d / %d %s  (%.0f%%)", event.Completed, event.Total, event.Unit, percent))
+	}
+	lines = append(lines, "", statusLabelStyle.Render("ACTIVITY"))
+	lines = append(lines, m.activityLines(8)...)
+	lines = append(lines, "", mutedStyle.Render("Progress is session-only. ctrl+c requests cancellation."))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (m model) resultView() string {
+	style := successStyle
+	status := "COMPLETED"
+	if m.result.err != nil {
+		style = errorStyle
+		status = "FAILED"
+	} else if m.result.warning {
+		style = warningStyle
+		status = "COMPLETED WITH WARNINGS"
+	}
+	lines := []string{sectionTitleStyle.Render(m.result.title), style.Render(status), "", m.result.detail}
+	if len(m.result.summary) > 0 {
+		lines = append(lines, "", statusLabelStyle.Render("SUMMARY"))
+		lines = append(lines, m.result.summary...)
+	}
+	if m.result.next != "" {
+		lines = append(lines, "", statusLabelStyle.Render("NEXT STEP"), m.result.next)
+	}
+	lines = append(lines, "", mutedStyle.Render("enter/esc return to dashboard"))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (m model) activityView() string {
+	lines := []string{sectionTitleStyle.Render("Session Activity"), mutedStyle.Render("Recent operation phases and outcomes. Nothing is written to repository metadata."), ""}
+	if len(m.activity) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, append(lines, "No operations have run in this session.")...)
+	}
+	lines = append(lines, m.activityLines(max(6, m.height-12))...)
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+func (m model) activityLines(limit int) []string {
+	start := max(0, len(m.activity)-limit)
+	lines := make([]string, 0, len(m.activity)-start)
+	for _, event := range m.activity[start:] {
+		line := fmt.Sprintf("%s  %-11s %s", event.Time.Format("15:04:05"), event.Phase, event.Message)
+		style := mutedStyle
+		if event.Level == pipeline.EventSuccess {
+			style = successStyle
+		} else if event.Level == pipeline.EventWarning {
+			style = warningStyle
+		}
+		lines = append(lines, style.Render(line))
+	}
+	return lines
+}
+
 func (m model) snapshotsView() string {
 	lines := []string{sectionTitleStyle.Render("Snapshot Catalog"), mutedStyle.Render("up/down move  / filter  enter restore  esc back"), ""}
 	if m.filtering || m.snapshotFilter.Value() != "" {
-		lines = append(lines, m.snapshotFilter.View(), "")
+		lines = append(lines, statusLabelStyle.Render("FILTER"), descriptionStyle.Render(snapshotFilterDescription), m.snapshotFilter.View(), "")
 	}
 	visible := m.visibleSnapshots()
 	if len(visible) == 0 {
@@ -483,6 +636,7 @@ var (
 	panelStyle        = lipgloss.NewStyle().Padding(1, 2)
 	sectionTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#17212B", Dark: "#F4F7FA"})
 	mutedStyle        = lipgloss.NewStyle().Foreground(mutedColor)
+	descriptionStyle  = lipgloss.NewStyle().Foreground(mutedColor).Width(formContentWidth)
 	statusLabelStyle  = lipgloss.NewStyle().Bold(true).Foreground(mutedColor)
 	warningStyle      = lipgloss.NewStyle().Bold(true).Foreground(warningColor)
 	successStyle      = lipgloss.NewStyle().Bold(true).Foreground(successColor)

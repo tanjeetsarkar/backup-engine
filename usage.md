@@ -16,6 +16,7 @@ Current behavior:
 - Enforces repository key-check metadata to catch passphrase/salt mismatches early.
 - Supports restore, verification, doctor checks, and retention-based garbage collection.
 - Includes an interactive TUI for guided operations.
+- Reports operation phases, aggregate progress, completion metrics, and recovery guidance.
 
 ## 2. Build
 
@@ -130,6 +131,13 @@ This command validates each snapshot by default and prints statuses such as:
 
 ## 4. Command reference
 
+Operational commands accept these output controls:
+- `-verbose`: show phase progress and a detailed final summary.
+- `-quiet`: show only the primary result.
+- `-json`: emit one machine-readable result and suppress progress output.
+
+Interactive terminals show detailed summaries by default. Redirected output remains concise unless `-verbose` is supplied. Progress and advisory messages are written to stderr; primary results are written to stdout.
+
 ### init
 - Required: `-repo`, `-passphrase`, `-salt`
 - Optional: `-bind-existing` for existing repositories without key-check metadata
@@ -185,13 +193,14 @@ The TUI is organized around a persistent dashboard with navigation on the left a
 
 Main sections:
 1. `Overview`: repository state and next action.
-2. `Repository`: repo path, masked passphrase/salt entry, and key-check validation.
-3. `Backup`: source path and retention tags.
-4. `Restore`: snapshot ID and destination path.
-5. `Snapshots`: readable-status catalog with filtering and direct restore handoff.
-6. `Health`: verify stored data and run doctor consistency checks.
-7. `Retention`: configure and run GFS garbage collection.
-8. `Setup`: initialize key-check metadata or bind an existing repository.
+2. `Activity`: bounded phase history for the current TUI session.
+3. `Repository`: repo path, masked passphrase/salt entry, and key-check validation.
+4. `Backup`: source path, retention tags, and planned transaction summary.
+5. `Restore`: snapshot ID, destination path, and overwrite warning.
+6. `Snapshots`: readable-status catalog with filtering and direct restore handoff.
+7. `Health`: verify stored data and run doctor consistency checks.
+8. `Retention`: review GFS policy and run garbage collection.
+9. `Setup`: initialize key-check metadata or bind an existing repository.
 
 Key controls:
 - `up`/`down` or `k`/`j`: navigate.
@@ -204,6 +213,16 @@ Key controls:
 - `q` or `ctrl+c`: quit from dashboard views.
 
 Path completion expands `~`, matches both prefixes and fuzzy character sequences, and marks directories with a trailing path separator. Passphrase and salt fields are masked.
+
+Every input includes inline guidance explaining what the value controls, its accepted format, and relevant safety implications. Read the description before submitting retention values, repository credentials, restore destinations, or existing-data binding choices.
+
+Long-running operations display:
+- the current phase and elapsed time;
+- aggregate file, snapshot, or chunk counters when totals are known;
+- a bounded activity log with timestamps;
+- a completion summary with measured results and a recommended next step.
+
+Normal activity excludes passphrases, salts, encryption keys, and per-file names. Activity is not persisted after the TUI exits.
 
 Safety profiles control destructive-action friction:
 - `strict`: type `GC` before garbage collection and `RESTORE` before restoring into an existing destination.

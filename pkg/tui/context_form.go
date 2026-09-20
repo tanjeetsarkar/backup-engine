@@ -18,6 +18,12 @@ type contextForm struct {
 	suggestion  int
 }
 
+var contextFieldDescriptions = []string{
+	"Folder containing the encrypted packfiles and index. Choose an existing repository or the directory you want Setup to initialize. Tab completes paths.",
+	"Secret used to derive this repository's encryption keys. It must exactly match the original value and cannot be recovered by the tool.",
+	"Stable value used with the passphrase for key derivation. Enter at least 16 characters and reuse the exact same salt every time you open this repository.",
+}
+
 func newContextForm(current repositoryContext) contextForm {
 	repo := textinput.New()
 	repo.Prompt = ""
@@ -142,12 +148,17 @@ func (f contextForm) View() string {
 		if index == f.focus {
 			label = accentStyle.Render(labels[index])
 		}
-		field := lipgloss.NewStyle().Width(54).Border(lipgloss.RoundedBorder()).BorderForeground(mutedColor).Padding(0, 1).Render(input.View())
+		field := lipgloss.NewStyle().Width(formContentWidth).Border(lipgloss.RoundedBorder()).BorderForeground(mutedColor).Padding(0, 1).Render(input.View())
 		if index == f.focus {
-			field = lipgloss.NewStyle().Width(54).Border(lipgloss.RoundedBorder()).BorderForeground(accentColor).Padding(0, 1).Render(input.View())
+			field = lipgloss.NewStyle().Width(formContentWidth).Border(lipgloss.RoundedBorder()).BorderForeground(accentColor).Padding(0, 1).Render(input.View())
 		}
-		lines = append(lines, label, field, "")
+		lines = append(lines, label, field)
 	}
+	lines = append(lines,
+		statusLabelStyle.Render("ABOUT THIS INPUT"),
+		descriptionStyle.Render(contextFieldDescriptions[f.focus]),
+		"",
+	)
 	if len(f.suggestions) > 0 {
 		lines = append(lines, statusLabelStyle.Render("PATH MATCHES"))
 		for index, candidate := range f.suggestions {

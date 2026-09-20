@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	backupcrypto "github.com/tanjeetsarkar/backup-engine/pkg/crypto"
 	"github.com/tanjeetsarkar/backup-engine/pkg/index"
@@ -32,32 +33,50 @@ type InitConfig struct {
 
 // InitRepository initializes repository structure and key-check metadata.
 func InitRepository(cfg InitConfig) error {
+	_, err := InitRepositoryDetailed(cfg, nil)
+	return err
+}
+
+// InitRepositoryDetailed initializes repository metadata and reports its phases.
+func InitRepositoryDetailed(cfg InitConfig, reporter Reporter) (result InitResult, err error) {
+	started := time.Now()
+	result.Repository = cfg.RepoDir
+	result.BoundExisting = cfg.BindExisting
+	defer func() { result.Duration = time.Since(started) }()
+	emit(reporter, ProgressEvent{Operation: OperationInit, Phase: PhasePreparing, Level: EventInfo, Message: "Preparing repository directories"})
+
 	if cfg.RepoDir == "" {
-		return fmt.Errorf("repo directory is required")
+		return result, fmt.Errorf("repo directory is required")
 	}
 	if len(cfg.Passphrase) == 0 {
-		return fmt.Errorf("passphrase is required")
+		return result, fmt.Errorf("passphrase is required")
 	}
 	if len(cfg.Salt) < 16 {
-		return fmt.Errorf("salt must be at least 16 bytes")
+		return result, fmt.Errorf("salt must be at least 16 bytes")
 	}
 
 	idx, err := index.Open(filepath.Join(cfg.RepoDir, "index", "index.db"))
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer idx.Close()
 
 	if _, err := pack.NewLocalFilesystemStorage(filepath.Join(cfg.RepoDir, "data")); err != nil {
-		return err
+		return result, err
 	}
 
 	km, err := backupcrypto.NewKeyManager(cfg.Passphrase, cfg.Salt)
 	if err != nil {
-		return err
+		return result, err
 	}
 
-	return ensureRepositoryKeyCheck(idx, km, cfg.BindExisting)
+	emit(reporter, ProgressEvent{Operation: OperationInit, Phase: PhaseCommitting, Level: EventInfo, Message: "Writing repository key-check metadata"})
+	if err := ensureRepositoryKeyCheck(idx, km, cfg.BindExisting); err != nil {
+		return result, err
+	}
+	result.KeyCheckReady = true
+	emit(reporter, ProgressEvent{Operation: OperationInit, Phase: PhaseComplete, Level: EventSuccess, Message: "Repository initialization completed"})
+	return result, nil
 }
 
 func ensureRepositoryKeyCheck(idx *index.DB, km *backupcrypto.KeyManager, bindExisting bool) error {
