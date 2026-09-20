@@ -29,6 +29,9 @@ type InitConfig struct {
 	Passphrase   []byte
 	Salt         []byte
 	BindExisting bool
+	// Storage overrides the pack storage backend (e.g. MinIO/S3 via NewStorageEngine). When nil,
+	// the local filesystem backend under RepoDir/data is created.
+	Storage pack.StorageEngine
 }
 
 // InitRepository initializes repository structure and key-check metadata.
@@ -54,18 +57,32 @@ func InitRepositoryDetailed(cfg InitConfig, reporter Reporter) (result InitResul
 	if len(cfg.Salt) < 16 {
 		return result, fmt.Errorf("salt must be at least 16 bytes")
 	}
+	lock, err := acquireMutationLock(cfg.RepoDir)
+	if err != nil {
+		return result, err
+	}
+	defer lock.release()
 
 	idx, err := index.Open(filepath.Join(cfg.RepoDir, "index", "index.db"))
 	if err != nil {
 		return result, err
 	}
 	defer idx.Close()
+	var km *backupcrypto.KeyManager
+	// Registered right after idx.Close so it executes first (LIFO) and still sees an open index.
+	defer func() {
+		finalResult := result
+		finalResult.Duration = time.Since(started)
+		_ = persistTransactionLog(idx, km, buildTransactionLogEntry(OperationInit, started, err, finalResult))
+	}()
 
-	if _, err := pack.NewLocalFilesystemStorage(filepath.Join(cfg.RepoDir, "data")); err != nil {
-		return result, err
+	if cfg.Storage == nil {
+		if _, err := newLocalStorageEngine(cfg.RepoDir); err != nil {
+			return result, err
+		}
 	}
 
-	km, err := backupcrypto.NewKeyManager(cfg.Passphrase, cfg.Salt)
+	km, err = backupcrypto.NewKeyManager(cfg.Passphrase, cfg.Salt)
 	if err != nil {
 		return result, err
 	}

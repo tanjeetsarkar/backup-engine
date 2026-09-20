@@ -30,6 +30,9 @@ func PresentError(err error) ErrorPresentation {
 	case errors.Is(err, ErrRepositoryNeedsInit):
 		presentation.Summary = "Repository key-check metadata is missing"
 		presentation.Hint = "Open Setup and bind the existing repository only after confirming its credentials."
+	case errors.Is(err, ErrRepositoryBusy):
+		presentation.Summary = "Repository is busy"
+		presentation.Hint = "Wait for the active backup, retention, or metadata operation to finish, then retry."
 	case errors.Is(err, os.ErrPermission):
 		presentation.Summary = "Permission denied"
 		presentation.Hint = "Check read/write permissions for the source, destination, and repository paths."

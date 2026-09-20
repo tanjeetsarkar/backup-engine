@@ -38,10 +38,7 @@ func (profile safetyProfile) next() safetyProfile {
 func confirmationFor(profile safetyProfile, form actionForm) (string, string) {
 	switch form.kind {
 	case actionGC:
-		if profile == safetyFast {
-			return "", ""
-		}
-		if profile == safetyStrict {
+		if profile == safetyStrict || profile == safetyFast {
 			return "GC", "Garbage collection can permanently remove unreferenced chunks."
 		}
 		return "yes", "Review the retention values before garbage collection."
@@ -59,6 +56,43 @@ func confirmationFor(profile safetyProfile, form actionForm) (string, string) {
 		return "yes", "The destination exists and may contain files with matching names."
 	}
 	return "", ""
+}
+
+func safetyDialogView(selected safetyProfile) string {
+	profiles := []struct {
+		profile     safetyProfile
+		title       string
+		description string
+	}{
+		{safetyStrict, "Strict", "Typed confirmation for overwrite, trash, retention changes, and garbage collection. Best for important repositories."},
+		{safetyStandard, "Standard", "Confirmation for destructive actions with lower friction for reversible changes. Recommended default."},
+		{safetyFast, "Fast", "Skips confirmation only for reversible actions. Irreversible garbage collection still requires typing GC."},
+	}
+	lines := []string{
+		sectionTitleStyle.Render("Safety profile"),
+		descriptionStyle.Render("Safety profiles reduce accidental actions. They are not a substitute for independent backups, encryption, permissions, or immutable storage."),
+		"",
+	}
+	for _, item := range profiles {
+		marker := "  "
+		style := statusLabelStyle
+		if item.profile == selected {
+			marker = "> "
+			style = accentStyle
+		}
+		lines = append(lines, style.Render(marker+item.title), descriptionStyle.Render("  "+item.description), "")
+	}
+	lines = append(lines,
+		statusLabelStyle.Render("ACTION MATRIX"),
+		"Restore overwrite  strict: RESTORE  standard/fast: yes",
+		"Trash snapshot     strict: TRASH    standard: yes  fast: immediate",
+		"Remove snapshot    always requires typed REMOVE (fast: yes) - instant, bypasses trash",
+		"Garbage collection strict/fast: GC  standard: yes",
+		"Metadata edits     reversible; snapshot contents stay unchanged",
+		"",
+		mutedStyle.Render("up/down choose  enter apply  esc cancel"),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 type confirmForm struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/tanjeetsarkar/backup-engine/pkg/pipeline"
@@ -108,6 +109,73 @@ func gcJSON(result pipeline.GCResult) map[string]any {
 		"chunks_purged":       result.ChunksPurged,
 		"decisions":           decisions,
 		"duration_ms":         result.Duration.Milliseconds(),
+	}
+}
+
+func hardDeleteJSON(result pipeline.HardDeleteResult) map[string]any {
+	return map[string]any{
+		"snapshot_id":      fmt.Sprintf("%x", result.SnapshotID),
+		"chunks_reclaimed": result.ChunksReclaimed,
+		"bytes_reclaimed":  result.BytesReclaimed,
+		"duration_ms":      result.Duration.Milliseconds(),
+	}
+}
+func snapshotDetailsJSON(detail pipeline.SnapshotDetails) map[string]any {
+	createdUTC := ""
+	createdLocal := ""
+	if !detail.Timestamp.IsZero() {
+		createdUTC = detail.Timestamp.UTC().Format(time.RFC3339)
+		createdLocal = detail.Timestamp.Local().Format(time.RFC3339)
+	}
+	parentID := ""
+	if detail.ParentSnapshotID != nil {
+		parentID = fmt.Sprintf("%x", *detail.ParentSnapshotID)
+	}
+	return map[string]any{
+		"snapshot_id":    fmt.Sprintf("%x", detail.ID),
+		"readable":       detail.Readable,
+		"status":         detail.StatusText,
+		"created_utc":    createdUTC,
+		"created_local":  createdLocal,
+		"total_files":    detail.TotalFiles,
+		"total_bytes":    detail.TotalBytes,
+		"retention_tags": detail.RetentionTags,
+		"parent_id":      parentID,
+		"state":          detail.Lifecycle.State,
+		"pinned":         detail.Lifecycle.Pinned,
+		"retain_until":   detail.Lifecycle.RetainUntil,
+		"labels":         detail.Lifecycle.Labels,
+		"note":           detail.Lifecycle.Note,
+		"trashed_at":     detail.Lifecycle.TrashedAt,
+		"purge_after":    detail.Lifecycle.PurgeAfter,
+	}
+}
+
+func replicationCountsJSON(counts pipeline.ReplicationCounts) map[string]any {
+	return map[string]any{
+		"items_replicated": counts.ItemsReplicated,
+		"items_skipped":    counts.ItemsSkipped,
+		"bytes_replicated": counts.BytesReplicated,
+	}
+}
+
+func replicateJSON(result pipeline.ReplicationResult) map[string]any {
+	return map[string]any{
+		"packs":       replicationCountsJSON(result.Packs),
+		"manifests":   replicationCountsJSON(result.Manifests),
+		"duration_ms": result.Duration.Milliseconds(),
+	}
+}
+
+func transactionLogEntryJSON(entry pipeline.TransactionLogEntry) map[string]any {
+	return map[string]any{
+		"operation":    entry.Operation,
+		"status":       entry.Status,
+		"started_at":   entry.StartedAt.UTC().Format(time.RFC3339),
+		"completed_at": entry.CompletedAt.UTC().Format(time.RFC3339),
+		"duration_ms":  entry.Duration.Milliseconds(),
+		"result":       entry.Result,
+		"error":        entry.Error,
 	}
 }
 

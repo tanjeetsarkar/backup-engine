@@ -12,7 +12,8 @@ Backup Engine is an experimental, local-first backup tool written in Go. It crea
 - XChaCha20-Poly1305 authenticated encryption
 - BLAKE3 content and storage identifiers
 - Deduplication across snapshots in one repository
-- Encrypted snapshot metadata and repository key-check validation
+- Encrypted snapshot metadata (protobuf wire format) and repository key-check validation
+- Symlinks, POSIX permissions, ownership, and extended attributes (including POSIX ACLs, carried as xattrs) are captured and restored
 - Local packfile storage with a bbolt index
 - Snapshot restore, integrity verification, and repository diagnostics
 - Grandfather-Father-Son retention and garbage collection
@@ -85,7 +86,7 @@ Run the binary without arguments in an interactive terminal, or use the explicit
 ./backup-engine tui
 ```
 
-The dashboard contains Overview, Activity, Repository, Backup, Restore, Snapshots, Health, Retention, and Setup sections. Operations show their current phase, aggregate counters, elapsed time, recent activity, and a final transaction summary with a suggested next step.
+The dashboard contains Overview, Activity, Repository, Backup, Restore, Snapshots, History, Health, Retention, and Setup sections. Operations show their current phase, aggregate counters, elapsed time, recent activity, and a final transaction summary with a suggested next step.
 
 Key controls:
 
@@ -95,12 +96,38 @@ Key controls:
 | `enter` | Open, select, or submit |
 | `tab` | Complete paths or cycle matching directories |
 | `/` | Filter snapshots |
-| `s` | Cycle strict, standard, and fast safety profiles |
+| `s` | Open descriptions and select a safety profile |
+| `d` | Trash or untrash the selected snapshot |
+| `p` | Pin or unpin the selected snapshot |
+| `x` | Permanently and instantly remove the selected snapshot (bypasses trash) |
+| `e` | Edit encrypted labels, note, and retain-until date |
 | `?` | Toggle expanded help |
 | `esc` | Return from a form or result |
 | `q`, `ctrl+c` | Quit from dashboard views |
 
-Passphrases and salts are masked. Activity history is bounded and exists only for the current TUI session.
+Passphrases and salts are masked. Activity history is bounded and exists only for the current TUI session. Every operation (backup, restore, gc, verify, doctor, snapshot remove, replicate, init) is additionally recorded as an encrypted entry in a persistent transaction history that survives across sessions and process restarts; see the `history` command and the TUI's History section below.
+
+Snapshot rows show the creation date in local time with timezone, status, lifecycle state, file count, and logical size. The selected details show the exact UTC timestamp, full metadata, labels, note, and retention overrides.
+
+Safety profiles are interaction safeguards, not substitutes for independent backups or immutable storage. Strict explains and strongly confirms destructive actions; Standard confirms destructive actions with less friction; Fast skips confirmation only for reversible actions. Garbage collection always requires explicit confirmation.
+
+## Managing Snapshots
+
+Manual removal uses recoverable trash rather than immediate deletion. A trashed snapshot is hidden from the active list but remains restorable until its purge date, seven days by default. Storage is reclaimed only when garbage collection runs after that deadline.
+
+For cases where destination space must be reclaimed right away, `snapshot remove` (CLI) or `x` (TUI) permanently deletes a snapshot immediately, bypassing trash entirely. It removes the snapshot's now-unreferenced chunks and repacks any affected packfiles on the spot, so disk usage drops immediately rather than waiting for a scheduled `gc`. This is irreversible and requires explicit confirmation (`-yes` on the CLI, a typed `REMOVE` in the TUI unless the Fast safety profile is active).
+
+```bash
+./backup-engine snapshot list -repo /tmp/backup-repo -passphrase "..." -salt "..."
+./backup-engine snapshot show -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID>
+./backup-engine snapshot trash -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID>
+./backup-engine snapshot untrash -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID>
+./backup-engine snapshot pin -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID>
+./backup-engine snapshot remove -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID> -yes
+./backup-engine snapshot edit -repo /tmp/backup-repo -passphrase "..." -salt "..." -id <ID> -labels important -note "Monthly archive" -retain-until 2030-01-01T00:00:00Z
+```
+
+Pinned snapshots and active snapshots with a future retain-until deadline override normal GFS expiration. Explicit trash takes precedence after its recovery window expires. Labels, notes, pins, and lifecycle dates are encrypted and do not alter immutable snapshot contents or IDs.
 
 ## CLI Output
 
@@ -150,6 +177,47 @@ The bbolt database contains chunk mappings, snapshot envelopes, and key-check me
 
 Do not edit repository files manually. Keep independent copies of the entire repository directory.
 
+## Storage Backends
+
+By default, every command that opens a repository uses local filesystem packfile storage under `<repository>/data`. The bbolt index (chunk mappings, snapshot envelopes, key-check metadata) is always local.
+
+Packfiles can instead be stored in a MinIO or other S3-compatible bucket by adding `-storage-backend minio` plus connection flags to any repository command (`init`, `backup`, `restore`, `list-snapshots`, `snapshot`, `gc`, `verify`, `doctor`):
+
+```bash
+./backup-engine backup \
+  -repo /tmp/backup-repo \
+  -source ~/Documents \
+  -passphrase "choose-a-strong-passphrase" \
+  -salt "0123456789abcdef" \
+  -storage-backend minio \
+  -s3-endpoint localhost:9000 \
+  -s3-bucket backup-engine-packs \
+  -s3-prefix optional/key/prefix \
+  -s3-access-key "$AWS_ACCESS_KEY_ID" \
+  -s3-secret-key "$AWS_SECRET_ACCESS_KEY" \
+  -s3-use-ssl=true
+```
+
+`-s3-access-key`/`-s3-secret-key` fall back to the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` environment variables when omitted. Use the same `-storage-backend`/`-s3-*` flags consistently across every command against a given repository; mixing backends for the same repository will make packs written under one backend invisible to commands using the other.
+
+## Replication
+
+`replicate run` copies a repository's packfiles and encrypted snapshot manifests to a second, offsite storage backend, without touching the primary repository's own backend. It is idempotent: already-replicated items are skipped, so it is safe to run repeatedly (e.g. on a schedule). Packs and manifests are stored under separate `packs`/`manifests` sub-prefixes at the remote so they can never collide.
+
+```bash
+./backup-engine replicate run \
+  -repo /tmp/backup-repo \
+  -passphrase "choose-a-strong-passphrase" \
+  -salt "0123456789abcdef" \
+  -remote-storage-backend minio \
+  -remote-s3-endpoint offsite-host:9000 \
+  -remote-s3-bucket backup-engine-offsite \
+  -remote-s3-access-key "$OFFSITE_ACCESS_KEY" \
+  -remote-s3-secret-key "$OFFSITE_SECRET_KEY"
+```
+
+Use `-remote-*` flags (mirroring the `-storage-backend`/`-s3-*` flags above) to describe the replication target; the repository's own `-storage-backend`/`-s3-*` flags (if any) describe where it is currently reading from. The remote backend must not be `local`. Replication never deletes data at either end, and does not currently throttle bandwidth or set retention/immutability policy on the remote bucket.
+
 ## Commands
 
 | Command | Purpose |
@@ -159,9 +227,12 @@ Do not edit repository files manually. Keep independent copies of the entire rep
 | `backup` | Create an encrypted snapshot |
 | `restore` | Restore a snapshot into a destination |
 | `list-snapshots` | List snapshots and metadata readability status |
+| `snapshot` | List, inspect, trash, restore, pin, remove, or edit snapshot lifecycle metadata |
 | `verify` | Authenticate and reconstruct all referenced data |
 | `doctor` | Check index mappings, pack records, and snapshot data |
 | `gc` | Apply GFS retention and remove unreferenced chunks |
+| `replicate` | Copy packfiles and manifests to a second, offsite storage backend |
+| `history` | List or prune the persistent, encrypted transaction history |
 
 ## Troubleshooting
 
@@ -177,13 +248,15 @@ Do not edit repository files manually. Keep independent copies of the entire rep
 
 ## Current Limitations
 
-- Snapshot envelopes use encrypted JSON; protobuf migration is planned.
-- Local storage is the primary supported workflow. The MinIO backend is present but not integrated into the main backup pipeline.
 - Remote object-lock and lifecycle policy automation are not complete.
-- Advanced metadata such as xattrs and ACLs is not restored.
-- Persistent transaction history is not implemented; TUI activity is session-only.
-- Repository-wide process locking and concurrent-writer guarantees are not yet documented or hardened.
+- Backup, GC, initialization, and lifecycle mutations use a one-writer repository lock.
+- Graceful pre-commit backup cancellation rolls back new mappings and packs. A durable journal cleans interrupted pre-commit backups when the repository reopens; a snapshot committed atomically before cancellation remains a valid snapshot.
+- GC repack now uses a durability journal analogous to the backup journal: an interrupted repack is rolled back to its pre-repack state on reopen, and the next GC run retries it.
 - Large-scale performance and interruption testing remain ongoing.
+
+## Why Not Rsync?
+
+Rsync is not integrated. Its file-delta model does not understand the atomic relationship among encrypted manifests, bbolt mappings, and immutable packfiles, and it is not a native object-store transport. Copying a live repository with rsync can capture mismatched index and pack state. The engine instead uses content-defined deduplication, checksummed packs, temporary files, atomic rename, one-writer locking, rollback, and recovery journals. Future replication should operate on a consistent repository checkpoint through the storage abstraction.
 
 ## Development
 

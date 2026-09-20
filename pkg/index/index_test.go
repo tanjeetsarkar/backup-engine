@@ -41,6 +41,25 @@ func TestCIDRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPutChunkMappingsWritesCompleteRecords(t *testing.T) {
+	idx := openTestDB(t)
+	defer idx.Close()
+	cid := filledArray(0x31)
+	storageID := filledArray(0x41)
+	location := ChunkLocation{PackID: filledArray(0x51), Offset: 12, Length: 34, UploadTimeUnix: 56}
+	if err := idx.PutChunkMappings([]ChunkMapping{{CID: cid, StorageID: storageID, Location: location}}); err != nil {
+		t.Fatal(err)
+	}
+	gotSID, found, err := idx.GetStorageID(cid)
+	if err != nil || !found || gotSID != storageID {
+		t.Fatalf("CID mapping: sid=%x found=%v err=%v", gotSID, found, err)
+	}
+	gotLocation, found, err := idx.GetChunkLocation(storageID)
+	if err != nil || !found || gotLocation != location {
+		t.Fatalf("chunk location: location=%+v found=%v err=%v", gotLocation, found, err)
+	}
+}
+
 func TestGetStorageIDNotFound(t *testing.T) {
 	idx := openTestDB(t)
 	defer idx.Close()

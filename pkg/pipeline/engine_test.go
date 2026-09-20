@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tanjeetsarkar/backup-engine/pkg/index"
 	"github.com/tanjeetsarkar/backup-engine/pkg/retention"
 )
 
@@ -159,6 +161,111 @@ func TestBackupDetailedReportsProgressAndDedupMetrics(t *testing.T) {
 	}
 }
 
+func TestBackupCancellationRollsBackPacksAndMappings(t *testing.T) {
+	repo := t.TempDir()
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "cancel.txt"), []byte("cancel after processing and before commit"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := Open(EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err = engine.BackupPathDetailed(ctx, source, nil, []string{"DAILY"}, func(event ProgressEvent) {
+		if event.Phase == PhaseProcessing && event.Completed == 1 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("backup error = %v, want context cancellation", err)
+	}
+	snapshots, err := engine.idx.ListSnapshotIDs()
+	if err != nil || len(snapshots) != 0 {
+		t.Fatalf("snapshots after rollback = %d, err=%v", len(snapshots), err)
+	}
+	records, err := engine.idx.ListChunkRecords()
+	if err != nil || len(records) != 0 {
+		t.Fatalf("chunk records after rollback = %d, err=%v", len(records), err)
+	}
+	packs, err := engine.storage.ListPacks(context.Background())
+	if err != nil || len(packs) != 0 {
+		t.Fatalf("packs after rollback = %d, err=%v", len(packs), err)
+	}
+}
+
+func TestMutationLockRejectsConcurrentWriter(t *testing.T) {
+	// Existing test code
+	repo := t.TempDir()
+	first, err := acquireMutationLock(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+	second, err := acquireMutationLock(repo)
+	if second != nil || !errors.Is(err, ErrRepositoryBusy) {
+		t.Fatalf("second lock = %v, err=%v", second, err)
+	}
+}
+
+func TestOpenRecoversInterruptedBackupJournal(t *testing.T) {
+	repo := t.TempDir()
+	config := EngineConfig{RepoDir: repo, Passphrase: []byte("passphrase"), Salt: []byte("0123456789abcdef")}
+	engine, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packID := filledID(0x61)
+	cid := filledID(0x62)
+	storageID := filledID(0x63)
+	if err := engine.storage.PutPack(context.Background(), packID, bytes.NewReader([]byte("orphan")), 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.idx.PutChunkMappings([]index.ChunkMapping{{CID: cid, StorageID: storageID, Location: index.ChunkLocation{PackID: packID, Length: 6}}}); err != nil {
+		t.Fatal(err)
+	}
+	transaction := backupTransaction{newPacks: [][32]byte{packID}, newStorageIDs: [][32]byte{storageID}}
+	if err := persistBackupJournal(engine.idx, &transaction); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err = Open(config)
+	if err != nil {
+		t.Fatalf("Open with recovery: %v", err)
+	}
+	defer engine.Close()
+	if _, found, err := engine.idx.GetChunkLocation(storageID); err != nil || found {
+		t.Fatalf("orphan mapping remains: found=%v err=%v", found, err)
+	}
+	packs, err := engine.storage.ListPacks(context.Background())
+	if err != nil || len(packs) != 0 {
+		t.Fatalf("orphan pack remains: packs=%v err=%v", packs, err)
+	}
+	if _, found, err := engine.idx.GetMeta(backupJournalMetaKey); err != nil || found {
+		t.Fatalf("journal remains after recovery: found=%v err=%v", found, err)
+	}
+}
+
+func TestSuccessfulBackupClearsRecoveryJournal(t *testing.T) {
+	engine, _ := createManagedSnapshot(t)
+	defer engine.Close()
+	if _, found, err := engine.idx.GetMeta(backupJournalMetaKey); err != nil || found {
+		t.Fatalf("journal remains after commit: found=%v err=%v", found, err)
+	}
+}
+
+func filledID(value byte) [32]byte {
+	var id [32]byte
+	for index := range id {
+		id[index] = value
+	}
+	return id
+}
 func TestVerifyAndDoctorHealthyRepository(t *testing.T) {
 	repo := t.TempDir()
 	sourceDir := t.TempDir()

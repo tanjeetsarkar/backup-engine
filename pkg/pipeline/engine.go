@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -20,6 +21,8 @@ import (
 	"github.com/tanjeetsarkar/backup-engine/pkg/manifest"
 	"github.com/tanjeetsarkar/backup-engine/pkg/pack"
 	"github.com/tanjeetsarkar/backup-engine/pkg/retention"
+	"github.com/zeebo/blake3"
+	"golang.org/x/sys/unix"
 )
 
 const defaultPackTargetSize = 16 * 1024 * 1024
@@ -30,10 +33,14 @@ type EngineConfig struct {
 	Passphrase     []byte
 	Salt           []byte
 	PackTargetSize int
+	// Storage overrides the pack storage backend (e.g. MinIO/S3 via NewStorageEngine). When nil,
+	// Open falls back to the local filesystem backend under RepoDir/data.
+	Storage pack.StorageEngine
 }
 
 // Engine coordinates backup/restore operations over local storage.
 type Engine struct {
+	repoDir        string
 	idx            *index.DB
 	storage        pack.StorageEngine
 	km             *backupcrypto.KeyManager
@@ -47,6 +54,9 @@ type SnapshotStatus struct {
 	ID         [32]byte
 	Readable   bool
 	StatusText string
+	Timestamp  time.Time
+	TotalFiles int64
+	TotalBytes int64
 }
 
 // Open initializes an engine bound to a local repository.
@@ -69,10 +79,22 @@ func Open(cfg EngineConfig) (*Engine, error) {
 		return nil, err
 	}
 
-	storage, err := pack.NewLocalFilesystemStorage(filepath.Join(cfg.RepoDir, "data"))
-	if err != nil {
+	storage := cfg.Storage
+	if storage == nil {
+		local, err := newLocalStorageEngine(cfg.RepoDir)
+		if err != nil {
+			_ = idx.Close()
+			return nil, err
+		}
+		storage = local
+	}
+	if err := recoverInterruptedBackup(cfg.RepoDir, idx, storage); err != nil {
 		_ = idx.Close()
-		return nil, err
+		return nil, fmt.Errorf("recover interrupted backup: %w", err)
+	}
+	if err := retention.RecoverInterruptedRepack(context.Background(), storage, idx); err != nil {
+		_ = idx.Close()
+		return nil, fmt.Errorf("recover interrupted gc repack: %w", err)
 	}
 
 	km, err := backupcrypto.NewKeyManager(cfg.Passphrase, cfg.Salt)
@@ -99,6 +121,7 @@ func Open(cfg EngineConfig) (*Engine, error) {
 	}
 
 	return &Engine{
+		repoDir:        cfg.RepoDir,
 		idx:            idx,
 		storage:        storage,
 		km:             km,
@@ -125,11 +148,37 @@ func (e *Engine) BackupPath(ctx context.Context, srcPath string, parent *[32]byt
 func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent *[32]byte, tags []string, reporter Reporter) (result BackupResult, err error) {
 	started := time.Now()
 	result.RetentionTags = append([]string(nil), tags...)
+	defer func() { e.recordTransaction(OperationBackup, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
+	lock, err := acquireMutationLock(e.repoDir)
+	if err != nil {
+		return result, err
+	}
+	defer lock.release()
+
+	existingPacks, err := e.storage.ListPacks(ctx)
+	if err != nil {
+		return result, err
+	}
+	transaction := backupTransaction{preexistingPacks: make(map[[32]byte]struct{}, len(existingPacks))}
+	for _, packID := range existingPacks {
+		transaction.preexistingPacks[packID] = struct{}{}
+	}
+	if err := persistBackupJournal(e.idx, &transaction); err != nil {
+		return result, err
+	}
+	committed := false
+	defer func() {
+		if !committed && err != nil {
+			if rollbackErr := e.rollbackBackup(&transaction); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("rollback backup: %w", rollbackErr))
+			}
+		}
+	}()
 
 	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseScanning, Level: EventInfo, Message: "Scanning source files"})
 
-	files, err := collectFiles(srcPath)
+	files, err := collectFilesContext(ctx, srcPath)
 	if err != nil {
 		return result, err
 	}
@@ -154,7 +203,7 @@ func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent 
 
 		if builder.IsFull() {
 			emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
-			if err := e.flushPackDetailed(ctx, builder, pending, &result); err != nil {
+			if err := e.flushPackDetailed(ctx, builder, pending, &result, &transaction); err != nil {
 				return result, err
 			}
 			builder = pack.NewPackfileBuilder(e.packTargetSize)
@@ -164,12 +213,15 @@ func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent 
 
 	if len(pending) > 0 {
 		emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseWriting, Level: EventInfo, Message: "Writing encrypted pack"})
-		if err := e.flushPackDetailed(ctx, builder, pending, &result); err != nil {
+		if err := e.flushPackDetailed(ctx, builder, pending, &result, &transaction); err != nil {
 			return result, err
 		}
 	}
 
 	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseCommitting, Level: EventInfo, Message: "Committing snapshot manifest"})
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	root := &manifest.DirectoryNode{Path: "/", Files: fileNodes}
 	snapshot, err := manifest.NewSnapshotManifest(parent, root, tags)
 	if err != nil {
@@ -179,9 +231,10 @@ func (e *Engine) BackupPathDetailed(ctx context.Context, srcPath string, parent 
 	if err != nil {
 		return result, err
 	}
-	if err := e.idx.PutSnapshot(snapshot.SnapshotID, env); err != nil {
+	if err := e.idx.CommitSnapshot(snapshot.SnapshotID, env, backupJournalMetaKey); err != nil {
 		return result, err
 	}
+	committed = true
 
 	result.SnapshotID = snapshot.SnapshotID
 	emit(reporter, ProgressEvent{Operation: OperationBackup, Phase: PhaseComplete, Level: EventSuccess, Message: "Backup completed", Completed: result.FilesProcessed, Total: result.FilesScanned, Unit: "files"})
@@ -199,6 +252,7 @@ func (e *Engine) RestoreSnapshotDetailed(ctx context.Context, snapshotID [32]byt
 	started := time.Now()
 	result.SnapshotID = snapshotID
 	result.Destination = destRoot
+	defer func() { e.recordTransaction(OperationRestore, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
 	emit(reporter, ProgressEvent{Operation: OperationRestore, Phase: PhasePreparing, Level: EventInfo, Message: "Loading snapshot manifest"})
 
@@ -252,36 +306,14 @@ func (e *Engine) ListSnapshots() ([][32]byte, error) {
 
 // ListSnapshotStatuses lists snapshots and whether their metadata can be decrypted with the current key.
 func (e *Engine) ListSnapshotStatuses() ([]SnapshotStatus, error) {
-	ids, err := e.ListSnapshots()
+	details, err := e.ListSnapshotDetails(true)
 	if err != nil {
 		return nil, err
 	}
-
-	statuses := make([]SnapshotStatus, 0, len(ids))
-	for _, id := range ids {
-		env, found, getErr := e.idx.GetSnapshot(id)
-		if getErr != nil {
-			statuses = append(statuses, SnapshotStatus{ID: id, Readable: false, StatusText: "index-read-error"})
-			continue
-		}
-		if !found {
-			statuses = append(statuses, SnapshotStatus{ID: id, Readable: false, StatusText: "missing"})
-			continue
-		}
-
-		_, decErr := manifest.DecryptSnapshotEnvelope(env, e.km)
-		if decErr != nil {
-			if errors.Is(decErr, backupcrypto.ErrAuthenticationFailed) {
-				statuses = append(statuses, SnapshotStatus{ID: id, Readable: false, StatusText: "auth-failed"})
-				continue
-			}
-			statuses = append(statuses, SnapshotStatus{ID: id, Readable: false, StatusText: "decode-error"})
-			continue
-		}
-
-		statuses = append(statuses, SnapshotStatus{ID: id, Readable: true, StatusText: "ok"})
+	statuses := make([]SnapshotStatus, 0, len(details))
+	for _, detail := range details {
+		statuses = append(statuses, SnapshotStatus{ID: detail.ID, Readable: detail.Readable, StatusText: detail.StatusText, Timestamp: detail.Timestamp, TotalFiles: detail.TotalFiles, TotalBytes: detail.TotalBytes})
 	}
-
 	return statuses, nil
 }
 
@@ -294,7 +326,13 @@ func (e *Engine) RunGC(ctx context.Context, policy retention.GFSPolicy, graceLim
 // RunGCDetailed applies retention and returns its evaluated decisions and aggregate metrics.
 func (e *Engine) RunGCDetailed(ctx context.Context, policy retention.GFSPolicy, graceLimit time.Duration, reporter Reporter) (result GCResult, err error) {
 	started := time.Now()
+	defer func() { e.recordTransaction(OperationGC, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
+	lock, err := acquireMutationLock(e.repoDir)
+	if err != nil {
+		return result, err
+	}
+	defer lock.release()
 	emit(reporter, ProgressEvent{Operation: OperationGC, Phase: PhasePlanning, Level: EventInfo, Message: "Evaluating snapshot retention"})
 
 	ids, err := e.idx.ListSnapshotIDs()
@@ -322,14 +360,37 @@ func (e *Engine) RunGCDetailed(ctx context.Context, policy retention.GFSPolicy, 
 	classified := retention.EvaluateGFS(manifests, policy)
 	result.SnapshotsEvaluated = int64(len(classified))
 	retained := make([]*manifest.SnapshotManifest, 0, len(classified))
+	purgedSnapshotIDs := make([][32]byte, 0)
+	now := time.Now()
 	for _, item := range classified {
-		decision := RetentionDecision{SnapshotID: item.Manifest.SnapshotID, Keep: item.Keep, Reason: item.Reason}
+		lifecycle, lifecycleErr := e.readSnapshotLifecycle(item.Manifest.SnapshotID)
+		if lifecycleErr != nil {
+			return result, lifecycleErr
+		}
+		keep := item.Keep
+		reason := item.Reason
+		if lifecycle.State == SnapshotTrashed {
+			keep = lifecycle.PurgeAfter == nil || lifecycle.PurgeAfter.After(now)
+			if keep {
+				reason = "Recoverable trash"
+			} else {
+				reason = "Trash recovery window expired"
+			}
+		} else if lifecycle.Pinned {
+			keep = true
+			reason = "Pinned"
+		} else if lifecycle.RetainUntil != nil && lifecycle.RetainUntil.After(now) {
+			keep = true
+			reason = "Retain-until override"
+		}
+		decision := RetentionDecision{SnapshotID: item.Manifest.SnapshotID, Keep: keep, Reason: reason}
 		result.Decisions = append(result.Decisions, decision)
-		if item.Keep {
+		if keep {
 			retained = append(retained, item.Manifest)
 			result.SnapshotsRetained++
 		} else {
 			result.SnapshotsDropped++
+			purgedSnapshotIDs = append(purgedSnapshotIDs, item.Manifest.SnapshotID)
 		}
 	}
 
@@ -356,6 +417,9 @@ func (e *Engine) RunGCDetailed(ctx context.Context, policy retention.GFSPolicy, 
 	if err != nil {
 		return result, err
 	}
+	if err := e.idx.DeleteSnapshots(purgedSnapshotIDs); err != nil {
+		return result, fmt.Errorf("delete expired snapshot metadata: %w", err)
+	}
 	emit(reporter, ProgressEvent{Operation: OperationGC, Phase: PhaseComplete, Level: EventSuccess, Message: "Garbage collection completed", Completed: result.ChunksPurged, Unit: "chunks"})
 	return result, nil
 }
@@ -369,6 +433,7 @@ func (e *Engine) Verify(ctx context.Context) error {
 // VerifyDetailed validates repository data and reports aggregate progress and metrics.
 func (e *Engine) VerifyDetailed(ctx context.Context, reporter Reporter) (result VerifyResult, err error) {
 	started := time.Now()
+	defer func() { e.recordTransaction(OperationVerify, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
 	emit(reporter, ProgressEvent{Operation: OperationVerify, Phase: PhasePreparing, Level: EventInfo, Message: "Loading snapshot catalog"})
 
@@ -430,6 +495,7 @@ func (e *Engine) Doctor(ctx context.Context) error {
 // DoctorDetailed checks index and data consistency and returns structured issues.
 func (e *Engine) DoctorDetailed(ctx context.Context, reporter Reporter) (result DoctorResult, err error) {
 	started := time.Now()
+	defer func() { e.recordTransaction(OperationDoctor, started, err, result) }()
 	defer func() { result.Duration = time.Since(started) }()
 	emit(reporter, ProgressEvent{Operation: OperationDoctor, Phase: PhaseChecking, Level: EventInfo, Message: "Checking chunk index and pack records"})
 
@@ -504,6 +570,12 @@ type pendingChunk struct {
 	StorageID [32]byte
 }
 
+type backupTransaction struct {
+	preexistingPacks map[[32]byte]struct{}
+	newPacks         [][32]byte
+	newStorageIDs    [][32]byte
+}
+
 func (e *Engine) backupOneFile(
 	ctx context.Context,
 	basePath string,
@@ -513,16 +585,12 @@ func (e *Engine) backupOneFile(
 	cache map[[32]byte][32]byte,
 	result *BackupResult,
 ) (*manifest.FileNode, []pendingChunk, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, pending, err
-	}
-
 	relPath := filePath
 	if fi, statErr := os.Stat(basePath); statErr == nil && fi.IsDir() {
-		relPath, err = filepath.Rel(basePath, filePath)
-		if err != nil {
-			return nil, pending, err
+		var relErr error
+		relPath, relErr = filepath.Rel(basePath, filePath)
+		if relErr != nil {
+			return nil, pending, relErr
 		}
 	}
 	if relPath == "." {
@@ -530,7 +598,45 @@ func (e *Engine) backupOneFile(
 	}
 	relPath = filepath.ToSlash(relPath)
 
-	ch := chunker.NewFastCDC(bytes.NewReader(data))
+	linkInfo, err := os.Lstat(filePath)
+	if err != nil {
+		return nil, pending, err
+	}
+	xattrs, err := captureXAttrs(filePath)
+	if err != nil {
+		return nil, pending, err
+	}
+	uid, gid := fileOwnership(linkInfo)
+
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		target, readErr := os.Readlink(filePath)
+		if readErr != nil {
+			return nil, pending, readErr
+		}
+		node := &manifest.FileNode{
+			Path:          relPath,
+			Mode:          uint32(linkInfo.Mode().Perm()),
+			ModTimeEpoch:  linkInfo.ModTime().Unix(),
+			UID:           uid,
+			GID:           gid,
+			SymlinkTarget: target,
+			XAttrs:        xattrs,
+		}
+		return node, pending, nil
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, pending, err
+	}
+	defer file.Close()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, pending, err
+	}
+
+	contentHasher := blake3.New()
+	ch := chunker.NewFastCDC(io.TeeReader(file, contentHasher))
 	storageIDs := make([][32]byte, 0)
 
 	for {
@@ -584,27 +690,27 @@ func (e *Engine) backupOneFile(
 		storageIDs = append(storageIDs, sid)
 	}
 
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return nil, pending, err
-	}
-
+	var contentHash [32]byte
+	copy(contentHash[:], contentHasher.Sum(nil))
 	node := &manifest.FileNode{
 		Path:         relPath,
-		Size:         int64(len(data)),
+		Size:         fileInfo.Size(),
 		Mode:         uint32(fileInfo.Mode().Perm()),
 		ModTimeEpoch: fileInfo.ModTime().Unix(),
 		StorageIDs:   storageIDs,
-		ContentHash:  backupcrypto.ComputeCID(data),
+		ContentHash:  contentHash,
+		UID:          uid,
+		GID:          gid,
+		XAttrs:       xattrs,
 	}
 	return node, pending, nil
 }
 
 func (e *Engine) flushPack(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk) error {
-	return e.flushPackDetailed(ctx, builder, pending, nil)
+	return e.flushPackDetailed(ctx, builder, pending, nil, nil)
 }
 
-func (e *Engine) flushPackDetailed(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk, result *BackupResult) error {
+func (e *Engine) flushPackDetailed(ctx context.Context, builder *pack.PackfileBuilder, pending []pendingChunk, result *BackupResult, transaction *backupTransaction) error {
 	if len(pending) == 0 {
 		return nil
 	}
@@ -617,31 +723,64 @@ func (e *Engine) flushPackDetailed(ctx context.Context, builder *pack.PackfileBu
 		return fmt.Errorf("pending chunk metadata mismatch")
 	}
 
-	if err := e.storage.PutPack(ctx, packID, bytes.NewReader(packBytes), int64(len(packBytes))); err != nil {
-		return err
+	preexisting := false
+	if transaction != nil {
+		_, preexisting = transaction.preexistingPacks[packID]
+		if !preexisting {
+			transaction.newPacks = append(transaction.newPacks, packID)
+		}
+		for _, meta := range pending {
+			transaction.newStorageIDs = append(transaction.newStorageIDs, meta.StorageID)
+		}
+		if err := persistBackupJournal(e.idx, transaction); err != nil {
+			return err
+		}
 	}
-	if result != nil {
-		result.PacksWritten++
-		result.StoredBytes += int64(len(packBytes))
+	if !preexisting {
+		if err := e.storage.PutPack(ctx, packID, bytes.NewReader(packBytes), int64(len(packBytes))); err != nil {
+			return err
+		}
+		if result != nil {
+			result.PacksWritten++
+			result.StoredBytes += int64(len(packBytes))
+		}
 	}
 
 	now := time.Now().Unix()
+	mappings := make([]index.ChunkMapping, 0, len(entries))
 	for i, entry := range entries {
 		meta := pending[i]
-		if err := e.idx.PutCID(meta.CID, meta.StorageID); err != nil {
-			return err
-		}
-		if err := e.idx.PutChunkLocation(meta.StorageID, index.ChunkLocation{
+		mappings = append(mappings, index.ChunkMapping{CID: meta.CID, StorageID: meta.StorageID, Location: index.ChunkLocation{
 			PackID:         packID,
 			Offset:         entry.Offset,
 			Length:         entry.Length,
 			UploadTimeUnix: now,
-		}); err != nil {
-			return err
-		}
+		}})
+	}
+	if err := e.idx.PutChunkMappings(mappings); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func (e *Engine) rollbackBackup(transaction *backupTransaction) error {
+	if transaction == nil {
+		return nil
+	}
+	var rollbackErr error
+	for index := len(transaction.newStorageIDs) - 1; index >= 0; index-- {
+		rollbackErr = errors.Join(rollbackErr, e.idx.DeleteChunk(transaction.newStorageIDs[index]))
+	}
+	for index := len(transaction.newPacks) - 1; index >= 0; index-- {
+		if err := e.storage.DeletePack(context.Background(), transaction.newPacks[index]); err != nil && !errors.Is(err, os.ErrNotExist) {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	if rollbackErr == nil {
+		rollbackErr = e.idx.DeleteMeta(backupJournalMetaKey)
+	}
+	return rollbackErr
 }
 
 func (e *Engine) restoreOneFile(ctx context.Context, destRoot string, fileNode *manifest.FileNode) error {
@@ -657,6 +796,20 @@ func (e *Engine) restoreOneFileDetailed(ctx context.Context, destRoot string, fi
 	outPath := filepath.Join(destRoot, filepath.FromSlash(cleanRel))
 	if err := os.MkdirAll(filepath.Dir(outPath), 0750); err != nil {
 		return err
+	}
+
+	if fileNode.IsSymlink() {
+		_ = os.Remove(outPath) // clear any leftover entry so Symlink does not fail with EEXIST
+		if err := os.Symlink(fileNode.SymlinkTarget, outPath); err != nil {
+			return err
+		}
+		if err := applyXAttrs(outPath, fileNode.XAttrs); err != nil {
+			return err
+		}
+		if err := applyOwnership(outPath, fileNode.UID, fileNode.GID); err != nil {
+			return err
+		}
+		return applySymlinkModTime(outPath, fileNode.ModTimeEpoch)
 	}
 
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fs.FileMode(fileNode.Mode))
@@ -678,11 +831,125 @@ func (e *Engine) restoreOneFileDetailed(ctx context.Context, destRoot string, fi
 		return err
 	}
 
+	if err := applyXAttrs(outPath, fileNode.XAttrs); err != nil {
+		return err
+	}
+	if err := applyOwnership(outPath, fileNode.UID, fileNode.GID); err != nil {
+		return err
+	}
+
 	if err := os.Chtimes(outPath, time.Unix(fileNode.ModTimeEpoch, 0), time.Unix(fileNode.ModTimeEpoch, 0)); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// fileOwnership extracts POSIX uid/gid from a Lstat result; unsupported platforms report 0,0.
+func fileOwnership(info os.FileInfo) (uid, gid uint32) {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return stat.Uid, stat.Gid
+	}
+	return 0, 0
+}
+
+// applyOwnership best-effort restores uid/gid, ignoring permission failures when not privileged.
+func applyOwnership(path string, uid, gid uint32) error {
+	if uid == 0 && gid == 0 {
+		return nil
+	}
+	if err := os.Lchown(path, int(uid), int(gid)); err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// applySymlinkModTime sets a symlink's own mtime without following it, unlike os.Chtimes.
+func applySymlinkModTime(path string, epoch int64) error {
+	ts := unix.NsecToTimeval(time.Unix(epoch, 0).UnixNano())
+	return unix.Lutimes(path, []unix.Timeval{ts, ts})
+}
+
+// captureXAttrs reads all extended attributes of path (without following symlinks); a
+// filesystem that does not support xattrs yields an empty result rather than an error.
+func captureXAttrs(path string) ([]manifest.XAttr, error) {
+	size, err := unix.Llistxattr(path, nil)
+	if err != nil {
+		if isXattrUnsupported(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if size == 0 {
+		return nil, nil
+	}
+	namesBuf := make([]byte, size)
+	n, err := unix.Llistxattr(path, namesBuf)
+	if err != nil {
+		if isXattrUnsupported(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	attrs := make([]manifest.XAttr, 0)
+	for _, name := range splitXattrNames(namesBuf[:n]) {
+		valueSize, err := unix.Lgetxattr(path, name, nil)
+		if err != nil {
+			if isXattrUnsupported(err) {
+				continue
+			}
+			return nil, err
+		}
+		if valueSize == 0 {
+			attrs = append(attrs, manifest.XAttr{Name: name})
+			continue
+		}
+		valueBuf := make([]byte, valueSize)
+		vn, err := unix.Lgetxattr(path, name, valueBuf)
+		if err != nil {
+			if isXattrUnsupported(err) {
+				continue
+			}
+			return nil, err
+		}
+		attrs = append(attrs, manifest.XAttr{Name: name, Value: valueBuf[:vn]})
+	}
+	return attrs, nil
+}
+
+// applyXAttrs restores previously captured extended attributes onto a restored path.
+func applyXAttrs(path string, attrs []manifest.XAttr) error {
+	for _, attr := range attrs {
+		if err := unix.Lsetxattr(path, attr.Name, attr.Value, 0); err != nil {
+			if isXattrUnsupported(err) || errors.Is(err, os.ErrPermission) {
+				continue
+			}
+			return fmt.Errorf("restore xattr %q: %w", attr.Name, err)
+		}
+	}
+	return nil
+}
+
+func isXattrUnsupported(err error) bool {
+	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENODATA)
+}
+
+func splitXattrNames(buf []byte) []string {
+	names := make([]string, 0)
+	start := 0
+	for i, b := range buf {
+		if b == 0 {
+			if i > start {
+				names = append(names, string(buf[start:i]))
+			}
+			start = i + 1
+		}
+	}
+	return names
 }
 
 func (e *Engine) materializeFileContent(ctx context.Context, fileNode *manifest.FileNode) ([]byte, error) {
@@ -755,6 +1022,10 @@ func (e *Engine) materializeFileContentDetailed(ctx context.Context, fileNode *m
 }
 
 func collectFiles(srcPath string) ([]string, error) {
+	return collectFilesContext(context.Background(), srcPath)
+}
+
+func collectFilesContext(ctx context.Context, srcPath string) ([]string, error) {
 	info, err := os.Stat(srcPath)
 	if err != nil {
 		return nil, err
@@ -766,6 +1037,9 @@ func collectFiles(srcPath string) ([]string, error) {
 
 	files := make([]string, 0)
 	err = filepath.WalkDir(srcPath, func(path string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}

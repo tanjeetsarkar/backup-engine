@@ -181,6 +181,18 @@ Each snapshot manifest contains:
 - `GFS_Tags`: Active retention markers (`DAILY`, `WEEKLY`, `MONTHLY`, `YEARLY`).
 - `TreeRoot`: Merkle root covering all file nodes and metadata entries.
 
+### 5.1 Mutable Snapshot Lifecycle Metadata
+
+Immutable snapshot content is managed separately from mutable operator metadata. The bbolt `snapshot_lifecycle` bucket stores metadata-key-encrypted, versioned records containing active/trashed state, pin status, retain-until, labels, notes, and trash/purge timestamps. Editing lifecycle metadata never changes the snapshot ID or Merkle tree.
+
+Snapshots move to recoverable trash before physical deletion. Trashed snapshots remain part of the GC live set until their purge deadline. Active pinned snapshots and active snapshots with a future retain-until deadline override normal GFS expiration.
+
+### 5.2 Backup Commit and Recovery Boundary
+
+Repository mutations use a cross-process one-writer lock. During backup, newly published pack IDs and chunk mappings are recorded in a durable operation journal. Each pack's CID, reverse-CID, and location records are written in one bbolt transaction. Immediately before snapshot commit, cancellation is checked again.
+
+Snapshot insertion and operation-journal deletion occur in one bbolt transaction, defining the commit point. Before that point, cancellation removes operation-owned mappings and packs. If the process terminates, repository open detects the journal and performs the same cleanup idempotently. If the journal is absent and the snapshot exists, commit completed and the snapshot is preserved.
+
 ---
 
 ## 6. Grandfather-Father-Son (GFS) Rotation & Safe Garbage Collection
@@ -223,6 +235,8 @@ Each snapshot manifest contains:
 ---
 
 ## 7. 3-2-1 Cloud Storage Topology & Immutability
+
+Rsync is not part of the repository protocol. It cannot create a transactionally consistent view of the bbolt index and immutable packfiles when copying a live repository. Replication must operate on a consistent checkpoint through the storage abstraction and verify content-addressed packs after transfer.
 
 ```
                        [Ingestion Pipeline]

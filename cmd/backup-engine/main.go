@@ -45,8 +45,23 @@ func main() {
 			printOperationError(err)
 			os.Exit(1)
 		}
+	case "snapshot":
+		if err := runSnapshot(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
 	case "gc":
 		if err := runGC(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
+	case "replicate":
+		if err := runReplicate(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
+	case "history":
+		if err := runHistory(os.Args[2:]); err != nil {
 			printOperationError(err)
 			os.Exit(1)
 		}
@@ -79,6 +94,7 @@ func main() {
 func runBackup(args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	source := fs.String("source", "", "source file or directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
@@ -88,10 +104,15 @@ func runBackup(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -124,6 +145,7 @@ func runBackup(args []string) error {
 func runRestore(args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	dest := fs.String("dest", "", "restore destination root")
 	snapshot := fs.String("snapshot", "", "snapshot id (hex)")
@@ -138,10 +160,15 @@ func runRestore(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -170,6 +197,7 @@ func runRestore(args []string) error {
 func runListSnapshots(args []string) error {
 	fs := flag.NewFlagSet("list-snapshots", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -178,10 +206,15 @@ func runListSnapshots(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -229,6 +262,7 @@ func runListSnapshots(args []string) error {
 func runGC(args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -246,10 +280,15 @@ func runGC(args []string) error {
 		return fmt.Errorf("invalid grace duration: %w", err)
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -285,6 +324,7 @@ func runGC(args []string) error {
 func runVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -292,10 +332,15 @@ func runVerify(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -326,6 +371,7 @@ func runVerify(args []string) error {
 func runDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -333,10 +379,15 @@ func runDoctor(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
 		Passphrase: []byte(*passphrase),
 		Salt:       []byte(*salt),
+		Storage:    storage,
 	})
 	if err != nil {
 		return err
@@ -379,6 +430,7 @@ func runDoctor(args []string) error {
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	output := bindOutputOptions(fs)
+	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	passphrase := fs.String("passphrase", "", "repository passphrase")
 	salt := fs.String("salt", "", "repository salt (min 16 chars)")
@@ -387,11 +439,16 @@ func runInit(args []string) error {
 		return err
 	}
 
+	storage, err := storageOpts.resolve(*repo)
+	if err != nil {
+		return err
+	}
 	result, err := pipeline.InitRepositoryDetailed(pipeline.InitConfig{
 		RepoDir:      *repo,
 		Passphrase:   []byte(*passphrase),
 		Salt:         []byte(*salt),
 		BindExisting: *bindExisting,
+		Storage:      storage,
 	}, output.reporter())
 	if err != nil {
 		return err
@@ -438,7 +495,10 @@ func splitTags(raw string) []string {
 
 func printUsage() {
 	fmt.Println("backup-engine <command> [flags]")
-	fmt.Println("commands: init, tui, backup, restore, list-snapshots, gc, verify, doctor")
+	fmt.Println("commands: init, tui, backup, restore, list-snapshots, snapshot, gc, replicate, history, verify, doctor")
+	fmt.Println("snapshot: backup-engine snapshot <list|show|trash|untrash|pin|unpin|remove|edit> [flags]")
+	fmt.Println("replicate: backup-engine replicate run -repo /repo -passphrase secret -salt 0123456789abcdef -remote-storage-backend minio -remote-s3-endpoint host:9000 -remote-s3-bucket offsite")
+	fmt.Println("history: backup-engine history <list|clear> -repo /repo -passphrase secret -salt 0123456789abcdef")
 	fmt.Println("init: backup-engine init -repo /repo -passphrase secret -salt 0123456789abcdef")
 	fmt.Println("tui:  backup-engine tui")
 	fmt.Println("example: backup-engine gc -repo /repo -passphrase secret -salt 0123456789abcdef -keep-daily 7")

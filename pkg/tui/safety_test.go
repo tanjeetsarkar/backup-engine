@@ -14,8 +14,8 @@ func TestGarbageCollectionConfirmationByProfile(t *testing.T) {
 	if phrase, _ := confirmationFor(safetyStandard, form); phrase != "yes" {
 		t.Fatalf("standard phrase = %q, want yes", phrase)
 	}
-	if phrase, _ := confirmationFor(safetyFast, form); phrase != "" {
-		t.Fatalf("fast phrase = %q, want none", phrase)
+	if phrase, _ := confirmationFor(safetyFast, form); phrase != "GC" {
+		t.Fatalf("fast phrase = %q, want GC", phrase)
 	}
 }
 

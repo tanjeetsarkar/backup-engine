@@ -6,12 +6,14 @@ import "time"
 type Operation string
 
 const (
-	OperationBackup  Operation = "backup"
-	OperationRestore Operation = "restore"
-	OperationVerify  Operation = "verify"
-	OperationDoctor  Operation = "doctor"
-	OperationGC      Operation = "gc"
-	OperationInit    Operation = "init"
+	OperationBackup     Operation = "backup"
+	OperationRestore    Operation = "restore"
+	OperationVerify     Operation = "verify"
+	OperationDoctor     Operation = "doctor"
+	OperationGC         Operation = "gc"
+	OperationInit       Operation = "init"
+	OperationHardDelete Operation = "snapshot-remove"
+	OperationReplicate  Operation = "replicate"
 )
 
 // Phase identifies the current stage of an operation.
@@ -140,4 +142,27 @@ type GCResult struct {
 	ChunksPurged       int64
 	Decisions          []RetentionDecision
 	Duration           time.Duration
+}
+
+// HardDeleteResult summarizes an instant, trash-bypassing snapshot removal.
+type HardDeleteResult struct {
+	SnapshotID      [32]byte
+	ChunksReclaimed int64
+	BytesReclaimed  int64
+	Duration        time.Duration
+}
+
+// ReplicationCounts summarizes one category (packs or manifests) of a replication pass.
+type ReplicationCounts struct {
+	ItemsReplicated int64
+	ItemsSkipped    int64
+	BytesReplicated int64
+}
+
+// ReplicationResult summarizes a full local-to-remote replication pass covering both packfiles
+// and snapshot manifests.
+type ReplicationResult struct {
+	Packs     ReplicationCounts
+	Manifests ReplicationCounts
+	Duration  time.Duration
 }

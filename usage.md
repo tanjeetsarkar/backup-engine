@@ -138,6 +138,14 @@ Operational commands accept these output controls:
 
 Interactive terminals show detailed summaries by default. Redirected output remains concise unless `-verbose` is supplied. Progress and advisory messages are written to stderr; primary results are written to stdout.
 
+Every command that opens a repository (`init`, `backup`, `restore`, `list-snapshots`, `snapshot`, `gc`, `verify`, `doctor`) also accepts storage backend flags:
+- `-storage-backend`: `local` (default) or `minio` for an S3-compatible bucket.
+- `-s3-endpoint`, `-s3-bucket`, `-s3-prefix`: MinIO/S3 connection target (endpoint and bucket are required when `-storage-backend minio`).
+- `-s3-access-key`, `-s3-secret-key`: credentials; fall back to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` when omitted.
+- `-s3-use-ssl`: defaults to `true`.
+
+The bbolt index (chunk mappings, snapshot envelopes, key-check metadata, lifecycle) always stays local under `<repo>/index`; only packfiles move to the configured backend. Use the same storage flags on every command against a given repository.
+
 ### init
 - Required: `-repo`, `-passphrase`, `-salt`
 - Optional: `-bind-existing` for existing repositories without key-check metadata
@@ -159,6 +167,19 @@ Running `./backup-engine` without a subcommand also opens the TUI when stdin and
 - Required: `-repo`, `-passphrase`, `-salt`
 - Optional: `-validate` default `true`
 
+### snapshot
+
+Snapshot lifecycle actions use `backup-engine snapshot <action>`:
+- `list`: newest-first catalog with local date/time, status, state, files, and size; add `-include-trash` for recoverable trash.
+- `show`: exact local and UTC dates plus lifecycle metadata; requires `-id`.
+- `trash`: move to recoverable trash; optional `-trash-for` defaults to `168h` (seven days).
+- `untrash`: return a snapshot to active state.
+- `pin` / `unpin`: protect from or return to normal GFS expiration.
+- `remove`: permanently and instantly delete a snapshot, bypassing trash, and reclaim its unreferenced chunks and packfile space immediately; requires `-yes` to confirm since it cannot be undone.
+- `edit`: update encrypted `-labels`, `-note`, and optional RFC3339 `-retain-until`; omitted values remain unchanged and `-clear-retain-until` removes the deadline.
+
+Trash is reversible until its purge date and does not immediately reclaim space. Garbage collection reclaims unshared chunks only after the recovery window expires. `remove` skips this entirely: it is irreversible but frees destination space right away.
+
 ### restore
 - Required: `-repo`, `-snapshot`, `-dest`, `-passphrase`, `-salt`
 
@@ -176,6 +197,22 @@ Running `./backup-engine` without a subcommand also opens the TUI when stdin and
   - `-keep-monthly` default `12`
   - `-keep-yearly` default `3`
   - `-grace` default `24h`
+
+### replicate
+- `backup-engine replicate run` copies packfiles and encrypted snapshot manifests from the
+  repository's own storage backend to a second, offsite backend. Idempotent: re-running skips
+  items already present at the remote.
+- Required: `-repo`, `-passphrase`, `-salt`, `-remote-storage-backend minio`, `-remote-s3-endpoint`, `-remote-s3-bucket`
+- Optional: `-remote-s3-prefix`, `-remote-s3-access-key`/`-remote-s3-secret-key` (fall back to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), `-remote-s3-use-ssl`
+- The remote backend must not be `local`. Packs and manifests are replicated under separate `packs`/`manifests` sub-prefixes so they cannot collide.
+
+### history
+- `backup-engine history list` prints persisted, encrypted transaction history entries (newest
+  first) for every operation type, including status, duration, and (on failure) the error message.
+  `-limit` bounds how many entries are returned (default 50, `0` for all).
+- `backup-engine history clear -before <RFC3339>` permanently deletes entries completed before the
+  given timestamp.
+- Required: `-repo`, `-passphrase`, `-salt`
 
 ## 5. Operational guidelines
 
@@ -198,16 +235,21 @@ Main sections:
 4. `Backup`: source path, retention tags, and planned transaction summary.
 5. `Restore`: snapshot ID, destination path, and overwrite warning.
 6. `Snapshots`: readable-status catalog with filtering and direct restore handoff.
-7. `Health`: verify stored data and run doctor consistency checks.
-8. `Retention`: review GFS policy and run garbage collection.
-9. `Setup`: initialize key-check metadata or bind an existing repository.
+7. `History`: persistent, encrypted transaction history across sessions (backup/restore/gc/verify/doctor/replicate/remove/init).
+8. `Health`: verify stored data and run doctor consistency checks.
+9. `Retention`: review GFS policy and run garbage collection.
+10. `Setup`: initialize key-check metadata or bind an existing repository.
 
 Key controls:
 - `up`/`down` or `k`/`j`: navigate.
 - `enter`: open a section, accept a candidate, or submit a form.
 - `tab`: complete paths and cycle matching directory names; use `up`/`down` to move between fields.
 - `/`: filter the snapshot catalog by ID or status.
-- `s`: cycle the `strict`, `standard`, and `fast` safety profiles.
+- `s`: open descriptions and select the `strict`, `standard`, or `fast` safety profile.
+- `d`: trash or untrash the selected snapshot.
+- `p`: pin or unpin the selected snapshot.
+- `x`: permanently and instantly remove the selected snapshot (bypasses trash); requires typed `REMOVE` confirmation unless the Fast safety profile is active.
+- `e`: edit encrypted labels, note, and retain-until date.
 - `?`: expand or collapse key help.
 - `esc`: return from a form or catalog.
 - `q` or `ctrl+c`: quit from dashboard views.
@@ -225,19 +267,26 @@ Long-running operations display:
 Normal activity excludes passphrases, salts, encryption keys, and per-file names. Activity is not persisted after the TUI exits.
 
 Safety profiles control destructive-action friction:
-- `strict`: type `GC` before garbage collection and `RESTORE` before restoring into an existing destination.
+- `strict`: typed confirmation for overwrite, trash, retention changes, and garbage collection.
 - `standard`: type `yes` for those operations.
-- `fast`: skips the GC confirmation, but still confirms restore into an existing destination.
+- `fast`: skips confirmation only for reversible actions; garbage collection still requires typing `GC`.
 
-## 7. Current limitations
+Safety profiles reduce accidental input. They are not backups, encryption, permissions, or immutability controls.
 
-- Snapshot envelope currently uses encrypted JSON metadata; protobuf migration is planned.
-- Current implementation focuses on local repository operations first.
+## 7. Cancellation and recovery
+
+Backup mutations are protected by a repository-wide one-writer lock. New packs and mappings are recorded in a durable operation journal. If a backup is cancelled before snapshot commit, operation-owned mappings and packs are removed. If the process stops unexpectedly, reopening the repository replays cleanup from the journal. Snapshot insertion and journal removal occur in one bbolt transaction, so recovery sees either an incomplete operation to remove or a complete snapshot to preserve.
+
+Do not use rsync against a live repository. It cannot create a consistent checkpoint across the bbolt index and packfiles. Rsync is intentionally not integrated; future replication will use the native storage abstraction and verified repository checkpoints.
+
+## 8. Current limitations
+
+- The MinIO/S3 backend must be configured consistently across all commands for a given repository; there is no automatic multi-backend replication yet.
 - Cloud immutability policy automation (Object Lock lifecycle workflow) is not yet fully wired.
-- Restore is file-content focused; advanced metadata/xattr restoration is limited.
+- Replication (`replicate run`) is one-shot/on-demand, not a scheduled background daemon; run it yourself on a schedule (e.g. cron) if continuous offsite sync is required.
 - Large-repository performance tuning and extensive chaos scenarios are still evolving.
 
-## 8. Recommended workflow for now
+## 9. Recommended workflow for now
 
 1. Initialize repository: `init`.
 2. Run backups on schedule.
@@ -245,7 +294,7 @@ Safety profiles control destructive-action friction:
 4. Use `doctor` periodically for consistency checks.
 5. Apply retention with `gc` in maintenance windows.
 
-## 9. Next usability improvements to consider
+## 10. Next usability improvements to consider
 
 1. Config file support (`backup-engine.yaml`) for repo defaults.
 2. Passphrase file or environment variable support (`-passphrase-file`, `BACKUP_ENGINE_PASSPHRASE`).

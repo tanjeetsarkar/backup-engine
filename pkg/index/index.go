@@ -1,21 +1,25 @@
 package index
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
 
 var (
-	bucketCIDs      = []byte("cids")
-	bucketCIDBySID  = []byte("cid_by_sid")
-	bucketChunks    = []byte("chunks")
-	bucketSnapshots = []byte("snapshots")
-	bucketMeta      = []byte("meta")
+	bucketCIDs               = []byte("cids")
+	bucketCIDBySID           = []byte("cid_by_sid")
+	bucketChunks             = []byte("chunks")
+	bucketSnapshots          = []byte("snapshots")
+	bucketSnapshotLifecycle  = []byte("snapshot_lifecycle")
+	bucketMeta               = []byte("meta")
+	bucketTransactionHistory = []byte("transaction_history")
 
 	ErrCorruptChunkLocation = errors.New("corrupt chunk location record")
 )
@@ -34,6 +38,38 @@ type ChunkLocation struct {
 type ChunkRecord struct {
 	StorageID [32]byte
 	Location  ChunkLocation
+}
+
+// ChunkMapping contains all index records committed for one stored chunk.
+type ChunkMapping struct {
+	CID       [32]byte
+	StorageID [32]byte
+	Location  ChunkLocation
+}
+
+// PutChunkMappings atomically writes CID, reverse-CID, and location records.
+func (d *DB) PutChunkMappings(mappings []ChunkMapping) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		cidBucket := tx.Bucket(bucketCIDs)
+		reverseBucket := tx.Bucket(bucketCIDBySID)
+		chunkBucket := tx.Bucket(bucketChunks)
+		if cidBucket == nil || reverseBucket == nil || chunkBucket == nil {
+			return fmt.Errorf("missing chunk index bucket")
+		}
+		for _, mapping := range mappings {
+			encoded := encodeChunkLocation(mapping.Location)
+			if err := cidBucket.Put(mapping.CID[:], mapping.StorageID[:]); err != nil {
+				return err
+			}
+			if err := reverseBucket.Put(mapping.StorageID[:], mapping.CID[:]); err != nil {
+				return err
+			}
+			if err := chunkBucket.Put(mapping.StorageID[:], encoded[:]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DB wraps the embedded bbolt index.
@@ -63,9 +99,77 @@ func Open(dbPath string) (*DB, error) {
 
 func (d *DB) initBuckets() error {
 	return d.db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketCIDs, bucketCIDBySID, bucketChunks, bucketSnapshots, bucketMeta} {
+		for _, name := range [][]byte{bucketCIDs, bucketCIDBySID, bucketChunks, bucketSnapshots, bucketSnapshotLifecycle, bucketMeta, bucketTransactionHistory} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return fmt.Errorf("create bucket %q: %w", string(name), err)
+			}
+		}
+		return nil
+	})
+}
+
+// PutSnapshotLifecycle stores encrypted mutable lifecycle metadata for a snapshot.
+func (d *DB) PutSnapshotLifecycle(snapshotID [32]byte, envelope []byte) error {
+	payload := append([]byte(nil), envelope...)
+	return d.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketSnapshotLifecycle)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketSnapshotLifecycle))
+		}
+		return bucket.Put(snapshotID[:], payload)
+	})
+}
+
+// GetSnapshotLifecycle reads encrypted mutable lifecycle metadata for a snapshot.
+func (d *DB) GetSnapshotLifecycle(snapshotID [32]byte) ([]byte, bool, error) {
+	var envelope []byte
+	found := false
+	err := d.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketSnapshotLifecycle)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketSnapshotLifecycle))
+		}
+		value := bucket.Get(snapshotID[:])
+		if value == nil {
+			return nil
+		}
+		envelope = append([]byte(nil), value...)
+		found = true
+		return nil
+	})
+	return envelope, found, err
+}
+
+// DeleteSnapshotLifecycle removes mutable lifecycle metadata for a snapshot.
+func (d *DB) DeleteSnapshotLifecycle(snapshotID [32]byte) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketSnapshotLifecycle)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketSnapshotLifecycle))
+		}
+		return bucket.Delete(snapshotID[:])
+	})
+}
+
+// DeleteSnapshot removes a snapshot envelope and its lifecycle metadata atomically.
+func (d *DB) DeleteSnapshot(snapshotID [32]byte) error {
+	return d.DeleteSnapshots([][32]byte{snapshotID})
+}
+
+// DeleteSnapshots atomically removes snapshot envelopes and lifecycle metadata.
+func (d *DB) DeleteSnapshots(snapshotIDs [][32]byte) error {
+	return d.db.Update(func(tx *bolt.Tx) error {
+		snapshots := tx.Bucket(bucketSnapshots)
+		lifecycle := tx.Bucket(bucketSnapshotLifecycle)
+		if snapshots == nil || lifecycle == nil {
+			return fmt.Errorf("missing snapshot bucket")
+		}
+		for _, snapshotID := range snapshotIDs {
+			if err := snapshots.Delete(snapshotID[:]); err != nil {
+				return err
+			}
+			if err := lifecycle.Delete(snapshotID[:]); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -195,6 +299,22 @@ func (d *DB) PutSnapshot(snapshotID [32]byte, envelope []byte) error {
 			return fmt.Errorf("missing bucket %q", string(bucketSnapshots))
 		}
 		return b.Put(snapshotID[:], payload)
+	})
+}
+
+// CommitSnapshot stores a snapshot and removes its operation journal atomically.
+func (d *DB) CommitSnapshot(snapshotID [32]byte, envelope []byte, journalKey string) error {
+	payload := append([]byte(nil), envelope...)
+	return d.db.Update(func(tx *bolt.Tx) error {
+		snapshots := tx.Bucket(bucketSnapshots)
+		meta := tx.Bucket(bucketMeta)
+		if snapshots == nil || meta == nil {
+			return fmt.Errorf("missing snapshot or metadata bucket")
+		}
+		if err := snapshots.Put(snapshotID[:], payload); err != nil {
+			return err
+		}
+		return meta.Delete([]byte(journalKey))
 	})
 }
 
@@ -351,6 +471,83 @@ func (d *DB) DeleteMeta(key string) error {
 		}
 		return b.Delete([]byte(key))
 	})
+}
+
+// transactionHistoryKey orders entries chronologically: a big-endian UnixNano timestamp followed
+// by a bucket-local sequence number that disambiguates same-nanosecond entries.
+func transactionHistoryKey(seq uint64, completedAt time.Time) []byte {
+	key := make([]byte, 16)
+	binary.BigEndian.PutUint64(key[0:8], uint64(completedAt.UnixNano()))
+	binary.BigEndian.PutUint64(key[8:16], seq)
+	return key
+}
+
+// PutTransactionLog appends one encrypted transaction history entry.
+func (d *DB) PutTransactionLog(completedAt time.Time, envelope []byte) error {
+	payload := append([]byte(nil), envelope...)
+	return d.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketTransactionHistory)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketTransactionHistory))
+		}
+		seq, err := bucket.NextSequence()
+		if err != nil {
+			return err
+		}
+		return bucket.Put(transactionHistoryKey(seq, completedAt), payload)
+	})
+}
+
+// ListTransactionLogs returns encrypted transaction history entries, newest first. limit <= 0
+// returns every entry.
+func (d *DB) ListTransactionLogs(limit int) ([][]byte, error) {
+	var entries [][]byte
+	err := d.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketTransactionHistory)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketTransactionHistory))
+		}
+		cursor := bucket.Cursor()
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			entries = append(entries, append([]byte(nil), v...))
+			if limit > 0 && len(entries) >= limit {
+				break
+			}
+		}
+		return nil
+	})
+	return entries, err
+}
+
+// DeleteTransactionLogsBefore removes history entries completed strictly before cutoff, returning
+// the number of entries removed.
+func (d *DB) DeleteTransactionLogsBefore(cutoff time.Time) (int, error) {
+	removed := 0
+	err := d.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketTransactionHistory)
+		if bucket == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketTransactionHistory))
+		}
+		cutoffPrefix := make([]byte, 8)
+		binary.BigEndian.PutUint64(cutoffPrefix, uint64(cutoff.UnixNano()))
+
+		cursor := bucket.Cursor()
+		var staleKeys [][]byte
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			if bytes.Compare(k[:8], cutoffPrefix) >= 0 {
+				break
+			}
+			staleKeys = append(staleKeys, append([]byte(nil), k...))
+		}
+		for _, k := range staleKeys {
+			if err := bucket.Delete(k); err != nil {
+				return err
+			}
+			removed++
+		}
+		return nil
+	})
+	return removed, err
 }
 
 func encodeChunkLocation(loc ChunkLocation) [chunkLocationSize]byte {

@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/dustin/go-humanize"
 	"github.com/tanjeetsarkar/backup-engine/pkg/pipeline"
 )
 
@@ -25,6 +26,7 @@ const (
 	sectionBackup
 	sectionRestore
 	sectionSnapshots
+	sectionHistory
 	sectionHealth
 	sectionRetention
 	sectionSetup
@@ -37,6 +39,7 @@ var sectionNames = []string{
 	"Backup",
 	"Restore",
 	"Snapshots",
+	"History",
 	"Health",
 	"Retention",
 	"Setup",
@@ -74,32 +77,37 @@ func (k keyMap) FullHelp() [][]key.Binding {
 }
 
 type model struct {
-	ctx             context.Context
-	active          section
-	mode            viewMode
-	width           int
-	height          int
-	help            help.Model
-	keys            keyMap
-	showHelp        bool
-	context         repositoryContext
-	form            contextForm
-	action          actionForm
-	confirm         confirmForm
-	spinner         spinner.Model
-	snapshots       []pipeline.SnapshotStatus
-	snapshotCursor  int
-	snapshotFilter  textinput.Model
-	filtering       bool
-	status          string
-	statusOK        bool
-	safety          safetyProfile
-	progress        pipeline.ProgressEvent
-	activity        []pipeline.ProgressEvent
-	progressStream  <-chan tea.Msg
-	operationStart  time.Time
-	operationCancel context.CancelFunc
-	result          taskResultMsg
+	ctx                   context.Context
+	active                section
+	mode                  viewMode
+	width                 int
+	height                int
+	help                  help.Model
+	keys                  keyMap
+	showHelp              bool
+	context               repositoryContext
+	form                  contextForm
+	action                actionForm
+	snapshotEdit          snapshotEditForm
+	confirm               confirmForm
+	pendingSnapshotAction string
+	spinner               spinner.Model
+	snapshots             []pipeline.SnapshotDetails
+	snapshotCursor        int
+	snapshotFilter        textinput.Model
+	filtering             bool
+	showTrashed           bool
+	history               []pipeline.TransactionLogEntry
+	status                string
+	statusOK              bool
+	safety                safetyProfile
+	safetySelection       safetyProfile
+	progress              pipeline.ProgressEvent
+	activity              []pipeline.ProgressEvent
+	progressStream        <-chan tea.Msg
+	operationStart        time.Time
+	operationCancel       context.CancelFunc
+	result                taskResultMsg
 }
 
 type viewMode int
@@ -109,8 +117,10 @@ const (
 	modeContextForm
 	modeActionForm
 	modeConfirm
+	modeSafety
 	modeBusy
 	modeSnapshots
+	modeSnapshotEdit
 	modeResult
 )
 
@@ -122,13 +132,22 @@ type repositoryContext struct {
 
 type contextValidatedMsg struct{ err error }
 
+type snapshotMutationMsg struct {
+	detail  pipeline.SnapshotDetails
+	title   string
+	message string
+	removed bool
+	err     error
+}
+
 type taskResultMsg struct {
 	title     string
 	detail    string
 	summary   []string
 	next      string
 	warning   bool
-	snapshots []pipeline.SnapshotStatus
+	snapshots []pipeline.SnapshotDetails
+	history   []pipeline.TransactionLogEntry
 	err       error
 }
 
@@ -180,6 +199,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.action, cmd = m.action.Update(message)
 			if m.action.submitted {
+				m.pendingSnapshotAction = ""
 				if phrase, reason := confirmationFor(m.safety, m.action); phrase != "" {
 					m.confirm = newConfirmForm(reason, phrase)
 					m.mode = modeConfirm
@@ -191,16 +211,40 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.mode == modeConfirm {
 			if message.String() == "esc" {
-				m.mode = modeActionForm
-				m.action.submitted = false
+				if m.pendingSnapshotAction != "" {
+					m.mode = modeSnapshots
+				} else {
+					m.mode = modeActionForm
+					m.action.submitted = false
+				}
+				m.pendingSnapshotAction = ""
 				return m, nil
 			}
 			var cmd tea.Cmd
 			m.confirm, cmd = m.confirm.Update(message)
 			if m.confirm.confirmed {
+				if m.pendingSnapshotAction != "" {
+					return m.startSnapshotMutation(m.pendingSnapshotAction)
+				}
 				return m.startActionOperation()
 			}
 			return m, cmd
+		}
+		if m.mode == modeSafety {
+			switch message.String() {
+			case "esc":
+				m.mode = modeNavigate
+			case "up", "k":
+				m.safetySelection = (m.safetySelection + 2) % 3
+			case "down", "j":
+				m.safetySelection = m.safetySelection.next()
+			case "enter":
+				m.safety = m.safetySelection
+				m.statusOK = true
+				m.status = "Safety profile changed to " + m.safety.String() + "."
+				m.mode = modeNavigate
+			}
+			return m, nil
 		}
 		if m.mode == modeSnapshots {
 			if m.filtering {
@@ -223,6 +267,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.filtering = true
 				m.snapshotFilter.Focus()
 				return m, textinput.Blink
+			case "t":
+				m.showTrashed = !m.showTrashed
+				m.snapshotCursor = 0
 			case "up", "k":
 				if m.snapshotCursor > 0 {
 					m.snapshotCursor--
@@ -239,8 +286,59 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeActionForm
 					return m, m.action.Init()
 				}
+			case "d":
+				if len(visible) > 0 {
+					selected := visible[m.snapshotCursor]
+					if selected.Lifecycle.State == pipeline.SnapshotTrashed {
+						return m.startSnapshotMutation("untrash")
+					}
+					if m.safety != safetyFast {
+						phrase := "yes"
+						if m.safety == safetyStrict {
+							phrase = "TRASH"
+						}
+						m.pendingSnapshotAction = "trash"
+						m.confirm = newConfirmForm("The snapshot will be hidden but remains recoverable for seven days. Storage is reclaimed only by later garbage collection.", phrase)
+						m.mode = modeConfirm
+						return m, m.confirm.Init()
+					}
+					return m.startSnapshotMutation("trash")
+				}
+			case "p":
+				if len(visible) > 0 {
+					return m.startSnapshotMutation("pin")
+				}
+			case "x":
+				if len(visible) > 0 {
+					phrase := "REMOVE"
+					if m.safety == safetyFast {
+						phrase = "yes"
+					}
+					m.pendingSnapshotAction = "remove"
+					m.confirm = newConfirmForm("This permanently deletes the snapshot right now and reclaims its unique chunks and packfile space; it does not go through recoverable trash and cannot be undone.", phrase)
+					m.mode = modeConfirm
+					return m, m.confirm.Init()
+				}
+			case "e":
+				if len(visible) > 0 {
+					m.snapshotEdit = newSnapshotEditForm(visible[m.snapshotCursor])
+					m.mode = modeSnapshotEdit
+					return m, m.snapshotEdit.Init()
+				}
 			}
 			return m, nil
+		}
+		if m.mode == modeSnapshotEdit {
+			if message.String() == "esc" {
+				m.mode = modeSnapshots
+				return m, nil
+			}
+			var command tea.Cmd
+			m.snapshotEdit, command = m.snapshotEdit.Update(message)
+			if m.snapshotEdit.submitted {
+				return m.startSnapshotMutation("edit")
+			}
+			return m, command
 		}
 		if m.mode == modeBusy {
 			return m, nil
@@ -266,9 +364,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.showHelp = !m.showHelp
 			m.help.ShowAll = m.showHelp
 		case key.Matches(message, m.keys.Safety):
-			m.safety = m.safety.next()
-			m.statusOK = true
-			m.status = "Safety profile changed to " + m.safety.String() + "."
+			m.safetySelection = m.safety
+			m.mode = modeSafety
 		case key.Matches(message, m.keys.Open):
 			switch m.active {
 			case sectionContext:
@@ -287,6 +384,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.action.Init()
 			case sectionSnapshots:
 				return m.startTask("Loading snapshots...", loadSnapshots(m.context))
+			case sectionHistory:
+				if m.context.repo == "" {
+					m.active = sectionContext
+					m.statusOK = false
+					m.status = "Connect a repository first."
+					return m, nil
+				}
+				return m.startTask("Loading transaction history...", loadHistory(m.context))
 			case sectionHealth:
 				if m.context.repo == "" {
 					m.active = sectionContext
@@ -338,6 +443,35 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.status = message.err.Error()
 		}
+	case snapshotMutationMsg:
+		if message.err != nil {
+			presentation := pipeline.PresentError(message.err)
+			m.result = taskResultMsg{title: presentation.Summary, detail: presentation.Cause, next: presentation.Hint, err: message.err}
+			m.mode = modeResult
+			return m, nil
+		}
+		if message.removed {
+			remaining := make([]pipeline.SnapshotDetails, 0, len(m.snapshots))
+			for _, snapshot := range m.snapshots {
+				if snapshot.ID != message.detail.ID {
+					remaining = append(remaining, snapshot)
+				}
+			}
+			m.snapshots = remaining
+			if m.snapshotCursor >= len(remaining) && m.snapshotCursor > 0 {
+				m.snapshotCursor--
+			}
+		} else {
+			for index := range m.snapshots {
+				if m.snapshots[index].ID == message.detail.ID {
+					m.snapshots[index] = message.detail
+					break
+				}
+			}
+		}
+		m.pendingSnapshotAction = ""
+		m.result = taskResultMsg{title: message.title, detail: message.message, next: "Return to the catalog to review the updated snapshot."}
+		m.mode = modeResult
 	case taskResultMsg:
 		if m.operationCancel != nil {
 			m.operationCancel()
@@ -362,6 +496,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.snapshotFilter.Prompt = "/ "
 			m.snapshotFilter.Placeholder = "filter by ID or status"
 			m.mode = modeSnapshots
+		} else if message.history != nil {
+			m.history = message.history
+			m.mode = modeNavigate
 		} else {
 			m.mode = modeResult
 		}
@@ -378,6 +515,24 @@ func (m model) startActionOperation() (tea.Model, tea.Cmd) {
 	m.operationCancel = cancel
 	m.beginOperation("Preparing operation", events)
 	return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runAction(operationContext, m.context, m.action, events))
+}
+
+func (m model) startSnapshotMutation(action string) (tea.Model, tea.Cmd) {
+	selected, ok := m.selectedSnapshot()
+	if !ok {
+		return m, nil
+	}
+	m.pendingSnapshotAction = action
+	m.beginOperation("Updating snapshot metadata", nil)
+	return m, mutateSnapshot(m.context, selected, action, m.snapshotEdit)
+}
+
+func (m model) selectedSnapshot() (pipeline.SnapshotDetails, bool) {
+	visible := m.visibleSnapshots()
+	if len(visible) == 0 || m.snapshotCursor >= len(visible) {
+		return pipeline.SnapshotDetails{}, false
+	}
+	return visible[m.snapshotCursor], true
 }
 
 func (m *model) beginOperation(status string, events <-chan tea.Msg) {
@@ -457,8 +612,14 @@ func (m model) detailView() string {
 	if m.mode == modeActionForm {
 		return m.action.View()
 	}
+	if m.mode == modeSnapshotEdit {
+		return m.snapshotEdit.View()
+	}
 	if m.mode == modeConfirm {
 		return m.confirm.View()
+	}
+	if m.mode == modeSafety {
+		return safetyDialogView(m.safetySelection)
 	}
 	if m.mode == modeBusy {
 		return m.busyView()
@@ -478,12 +639,16 @@ func (m model) detailView() string {
 		sectionBackup:    "Create a deduplicated, encrypted snapshot.",
 		sectionRestore:   "Recover a snapshot into a chosen destination.",
 		sectionSnapshots: "Browse, filter, and inspect available snapshots.",
+		sectionHistory:   "Persistent, encrypted record of past operations across sessions.",
 		sectionHealth:    "Verify stored data and diagnose index consistency.",
 		sectionRetention: "Apply retention policy and compact unreferenced data.",
 		sectionSetup:     "Initialize a new repository or bind key-check metadata.",
 	}[m.active]
 	if m.active == sectionActivity {
 		return m.activityView()
+	}
+	if m.active == sectionHistory {
+		return m.historyView()
 	}
 
 	contextStatus := warningStyle.Render("Not configured")
@@ -582,8 +747,35 @@ func (m model) activityLines(limit int) []string {
 	return lines
 }
 
+func (m model) historyView() string {
+	lines := []string{sectionTitleStyle.Render("Transaction History"), mutedStyle.Render("Persistent, encrypted record of past operations; survives across TUI sessions and process restarts."), ""}
+	if len(m.history) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, append(lines, "No transaction history recorded yet.")...)
+	}
+	limit := max(6, m.height-12)
+	for index, entry := range m.history {
+		if index >= limit {
+			break
+		}
+		style := successStyle
+		if entry.Status != "success" {
+			style = errorStyle
+		}
+		line := fmt.Sprintf("%s  %-16s %-7s %s", entry.CompletedAt.Local().Format("2006-01-02 15:04:05"), entry.Operation, entry.Status, entry.Duration.Round(10*time.Millisecond))
+		lines = append(lines, style.Render(line))
+		if entry.Status != "success" && entry.Error != "" {
+			lines = append(lines, mutedStyle.Render("    "+entry.Error))
+		}
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
 func (m model) snapshotsView() string {
-	lines := []string{sectionTitleStyle.Render("Snapshot Catalog"), mutedStyle.Render("up/down move  / filter  enter restore  esc back"), ""}
+	trashMode := "hidden"
+	if m.showTrashed {
+		trashMode = "shown"
+	}
+	lines := []string{sectionTitleStyle.Render("Snapshot Catalog"), mutedStyle.Render("up/down move  / filter  t show/hide trash  enter restore  d trash/untrash  p pin  x remove  e edit"), mutedStyle.Render("Recoverable trash: " + trashMode), ""}
 	if m.filtering || m.snapshotFilter.Value() != "" {
 		lines = append(lines, statusLabelStyle.Render("FILTER"), descriptionStyle.Render(snapshotFilterDescription), m.snapshotFilter.View(), "")
 	}
@@ -602,23 +794,70 @@ func (m model) snapshotsView() string {
 		if !snapshot.Readable {
 			status = errorStyle.Render(snapshot.StatusText)
 		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%x", marker, snapshot.ID))+"  "+status)
+		date := "date unavailable"
+		if !snapshot.Timestamp.IsZero() {
+			date = snapshot.Timestamp.Local().Format("2006-01-02 15:04 MST")
+		}
+		state := string(snapshot.Lifecycle.State)
+		if snapshot.Lifecycle.Pinned {
+			state += ", pinned"
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%s  %x", marker, date, snapshot.ID[:4]))+"  "+status+"  "+mutedStyle.Render(state))
 	}
+	selected := visible[m.snapshotCursor]
+	lines = append(lines, "", statusLabelStyle.Render("SELECTED SNAPSHOT"))
+	lines = append(lines, snapshotDetailLines(selected)...)
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-func (m model) visibleSnapshots() []pipeline.SnapshotStatus {
+func (m model) visibleSnapshots() []pipeline.SnapshotDetails {
 	query := strings.ToLower(strings.TrimSpace(m.snapshotFilter.Value()))
-	if query == "" {
-		return m.snapshots
-	}
-	visible := make([]pipeline.SnapshotStatus, 0, len(m.snapshots))
+	visible := make([]pipeline.SnapshotDetails, 0, len(m.snapshots))
 	for _, snapshot := range m.snapshots {
-		if strings.Contains(strings.ToLower(fmt.Sprintf("%x", snapshot.ID)), query) || strings.Contains(strings.ToLower(snapshot.StatusText), query) {
+		if snapshot.Lifecycle.State == pipeline.SnapshotTrashed && !m.showTrashed {
+			continue
+		}
+		searchable := fmt.Sprintf("%x %s %s %s %s", snapshot.ID, snapshot.StatusText, snapshot.Timestamp.Local().Format("2006-01-02 15:04 MST"), snapshot.Lifecycle.State, strings.Join(snapshot.Lifecycle.Labels, " "))
+		if query == "" || strings.Contains(strings.ToLower(searchable), query) || strings.Contains(strings.ToLower(snapshot.Lifecycle.Note), query) {
 			visible = append(visible, snapshot)
 		}
 	}
 	return visible
+}
+
+func snapshotDetailLines(snapshot pipeline.SnapshotDetails) []string {
+	created := "unavailable"
+	if !snapshot.Timestamp.IsZero() {
+		created = snapshot.Timestamp.UTC().Format(time.RFC3339)
+	}
+	parent := "none"
+	if snapshot.ParentSnapshotID != nil {
+		parent = fmt.Sprintf("%x", *snapshot.ParentSnapshotID)
+	}
+	labels := "none"
+	if len(snapshot.Lifecycle.Labels) > 0 {
+		labels = strings.Join(snapshot.Lifecycle.Labels, ", ")
+	}
+	retainUntil := "none"
+	if snapshot.Lifecycle.RetainUntil != nil {
+		retainUntil = snapshot.Lifecycle.RetainUntil.Local().Format("2006-01-02 15:04 MST")
+	}
+	return []string{
+		fmt.Sprintf("Created UTC   %s", created),
+		fmt.Sprintf("Files / size %d / %s", snapshot.TotalFiles, humanize.IBytes(uint64(max(0, snapshot.TotalBytes)))),
+		fmt.Sprintf("State        %s", snapshot.Lifecycle.State),
+		fmt.Sprintf("Labels       %s", labels),
+		fmt.Sprintf("Note         %s", emptyAs(snapshot.Lifecycle.Note, "none")),
+		fmt.Sprintf("Retain until %s", retainUntil),
+		fmt.Sprintf("Parent       %s", parent),
+	}
+}
+
+func emptyAs(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 var (

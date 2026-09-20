@@ -112,8 +112,84 @@ func loadSnapshots(repository repositoryContext) tea.Cmd {
 			return taskResultMsg{title: "Could not load snapshots", err: err}
 		}
 		defer engine.Close()
-		snapshots, err := engine.ListSnapshotStatuses()
+		snapshots, err := engine.ListSnapshotDetails(true)
 		return taskResultMsg{title: "Could not load snapshots", detail: fmt.Sprintf("Loaded %d snapshots.", len(snapshots)), snapshots: snapshots, err: err}
+	}
+}
+
+func loadHistory(repository repositoryContext) tea.Cmd {
+	return func() tea.Msg {
+		engine, err := openRepository(repository)
+		if err != nil {
+			return taskResultMsg{title: "Could not load transaction history", err: err}
+		}
+		defer engine.Close()
+		entries, err := engine.ListTransactionHistory(200)
+		return taskResultMsg{title: "Could not load transaction history", detail: fmt.Sprintf("Loaded %d history entries.", len(entries)), history: entries, err: err}
+	}
+}
+
+func mutateSnapshot(repository repositoryContext, selected pipeline.SnapshotDetails, action string, form snapshotEditForm) tea.Cmd {
+	return func() tea.Msg {
+		engine, err := openRepository(repository)
+		if err != nil {
+			return snapshotMutationMsg{err: err}
+		}
+		defer engine.Close()
+		if action == "remove" {
+			result, err := engine.HardDeleteSnapshotDetailed(context.Background(), selected.ID, nil)
+			if err != nil {
+				return snapshotMutationMsg{err: err}
+			}
+			message := fmt.Sprintf("Snapshot removed instantly. Reclaimed %d chunks (%d bytes).", result.ChunksReclaimed, result.BytesReclaimed)
+			return snapshotMutationMsg{detail: pipeline.SnapshotDetails{ID: selected.ID}, removed: true, title: "Snapshot removed", message: message}
+		}
+		switch action {
+		case "trash":
+			_, err = engine.TrashSnapshot(selected.ID, pipeline.DefaultTrashRetention)
+		case "untrash":
+			_, err = engine.UntrashSnapshot(selected.ID)
+		case "pin":
+			_, err = engine.SetSnapshotPin(selected.ID, !selected.Lifecycle.Pinned)
+		case "edit":
+			var update pipeline.SnapshotMetadataUpdate
+			var retainUntil *time.Time
+			update, retainUntil, err = form.values()
+			if err == nil {
+				_, err = engine.UpdateSnapshotMetadata(selected.ID, update)
+			}
+			if err == nil {
+				_, err = engine.SetSnapshotRetainUntil(selected.ID, retainUntil)
+			}
+		default:
+			err = fmt.Errorf("unsupported snapshot action %q", action)
+		}
+		if err != nil {
+			return snapshotMutationMsg{err: err}
+		}
+		detail, err := engine.GetSnapshotDetails(selected.ID)
+		return snapshotMutationMsg{detail: detail, title: "Snapshot updated", message: snapshotActionMessage(action, detail), err: err}
+	}
+}
+
+func snapshotActionMessage(action string, detail pipeline.SnapshotDetails) string {
+	switch action {
+	case "trash":
+		if detail.Lifecycle.PurgeAfter != nil {
+			return "Snapshot moved to recoverable trash until " + detail.Lifecycle.PurgeAfter.Local().Format("2006-01-02 15:04 MST") + "."
+		}
+		return "Snapshot moved to recoverable trash."
+	case "untrash":
+		return "Snapshot restored to the active catalog."
+	case "pin":
+		if detail.Lifecycle.Pinned {
+			return "Snapshot pinned against GFS expiration."
+		}
+		return "Snapshot unpinned; normal retention policy applies."
+	case "edit":
+		return "Encrypted labels, note, and retention override were updated."
+	default:
+		return "Snapshot metadata updated."
 	}
 }
 

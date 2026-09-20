@@ -3,7 +3,10 @@ package retention
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -13,10 +16,45 @@ import (
 
 const gcCompactionDeadRatioThreshold = 0.40
 
+// GCRepackJournalMetaKey is the meta key holding an in-progress repack's durability journal.
+const GCRepackJournalMetaKey = "operation.gc-repack.v1"
+
+// GCRepackJournal records a repack in flight so an interrupted repack can be rolled back on reopen.
+type GCRepackJournal struct {
+	Version   int      `json:"version"`
+	OldPackID [32]byte `json:"old_pack_id"`
+	NewPackID [32]byte `json:"new_pack_id"`
+}
+
 // ChunkCatalog is the mutable chunk index used by garbage collection.
 type ChunkCatalog interface {
 	UpsertChunkLocation(storageID [32]byte, packID [32]byte, offset uint64, length uint32, uploadTimeUnix int64) error
 	DeleteChunk(storageID [32]byte) error
+	PutMeta(key string, value []byte) error
+	GetMeta(key string) (value []byte, found bool, err error)
+	DeleteMeta(key string) error
+}
+
+// RecoverInterruptedRepack rolls back an incomplete repack detected via its durability journal.
+// The old pack and its catalog entries are left untouched so a subsequent GC run retries the repack
+// from scratch; only the possibly-orphaned new pack is removed.
+func RecoverInterruptedRepack(ctx context.Context, storage pack.StorageEngine, catalog ChunkCatalog) error {
+	raw, found, err := catalog.GetMeta(GCRepackJournalMetaKey)
+	if err != nil || !found {
+		return err
+	}
+	var journal GCRepackJournal
+	if err := json.Unmarshal(raw, &journal); err != nil {
+		return fmt.Errorf("decode gc repack recovery journal: %w", err)
+	}
+	if journal.Version != 1 {
+		return fmt.Errorf("unsupported gc repack recovery journal version %d", journal.Version)
+	}
+
+	if err := storage.DeletePack(ctx, journal.NewPackID); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove orphaned repack pack: %w", err)
+	}
+	return catalog.DeleteMeta(GCRepackJournalMetaKey)
 }
 
 // GFSPolicy defines retention quotas.
@@ -207,6 +245,12 @@ func (gc *GarbageCollector) repack(
 		return fmt.Errorf("storage engine is nil")
 	}
 
+	if gc.catalog != nil {
+		if err := gc.catalog.DeleteMeta(GCRepackJournalMetaKey); err != nil {
+			return fmt.Errorf("clear stale repack journal: %w", err)
+		}
+	}
+
 	builder := pack.NewPackfileBuilder(16 * 1024 * 1024)
 	liveOrder := make([]ChunkLocation, 0, len(packChunks))
 
@@ -252,6 +296,17 @@ func (gc *GarbageCollector) repack(
 		return fmt.Errorf("live order and index entry count mismatch")
 	}
 
+	if gc.catalog != nil {
+		journal := GCRepackJournal{Version: 1, OldPackID: packID, NewPackID: newPackID}
+		raw, err := json.Marshal(journal)
+		if err != nil {
+			return fmt.Errorf("encode repack journal: %w", err)
+		}
+		if err := gc.catalog.PutMeta(GCRepackJournalMetaKey, raw); err != nil {
+			return fmt.Errorf("persist repack journal: %w", err)
+		}
+	}
+
 	if err := gc.storage.PutPack(ctx, newPackID, bytes.NewReader(newPackBytes), int64(len(newPackBytes))); err != nil {
 		return err
 	}
@@ -266,5 +321,13 @@ func (gc *GarbageCollector) repack(
 		}
 	}
 
-	return gc.storage.DeletePack(ctx, packID)
+	if err := gc.storage.DeletePack(ctx, packID); err != nil {
+		return err
+	}
+	if gc.catalog != nil {
+		if err := gc.catalog.DeleteMeta(GCRepackJournalMetaKey); err != nil {
+			return fmt.Errorf("clear repack journal: %w", err)
+		}
+	}
+	return nil
 }
