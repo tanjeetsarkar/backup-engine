@@ -1,0 +1,29 @@
+# Go build artifacts
+/backup-engine
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage reports
+coverage.out
+*.coverprofile
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Local backup repository data
+/dist/*
