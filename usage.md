@@ -17,6 +17,11 @@ Current behavior:
 - Supports restore, verification, doctor checks, and retention-based garbage collection.
 - Includes an interactive TUI for guided operations.
 - Reports operation phases, aggregate progress, completion metrics, and recovery guidance.
+- **Credential input via file or environment variable** (`-passphrase-file`, `-salt-file`, `BACKUP_ENGINE_PASSPHRASE`, `BACKUP_ENGINE_SALT`)
+- **S3 Object Lock / WORM retention** (`-s3-object-lock-days`, `-s3-object-lock-compliance`)
+- **Disaster recovery** (`recover` rebuilds a repository from a remote replica)
+- **Bit-rot scrubbing** (`scrub` validates every packfile's checksum without decrypting)
+- **Version introspection** (`version` subcommand)
 
 ## 2. Build
 
@@ -58,6 +63,14 @@ If the repository already contains backup data created before key-check metadata
   -salt "0123456789abcdef" \
   -bind-existing
 ```
+
+**Credential input options (all commands):**
+- `-passphrase-file <path>` — read passphrase from a file (trimmed of whitespace)
+- `-salt-file <path>` — read salt from a file (trimmed of whitespace)
+- `BACKUP_ENGINE_PASSPHRASE` environment variable
+- `BACKUP_ENGINE_SALT` environment variable
+
+Precedence: flag > file > environment variable. Prefer file or env var; plain flags are visible in shell history and `ps`/`/proc/<pid>/cmdline`.
 
 ### 3.1 Create a backup snapshot
 
@@ -115,6 +128,15 @@ This command validates each snapshot by default and prints statuses such as:
   -salt "0123456789abcdef"
 ```
 
+### 3.5 Run scrub (bit-rot detection without decrypting)
+
+```bash
+./backup-engine scrub \
+  -repo /tmp/backup-repo \
+  -passphrase "your-passphrase" \
+  -salt "0123456789abcdef"
+```
+
 ### 3.6 Run garbage collection with GFS policy
 
 ```bash
@@ -129,6 +151,12 @@ This command validates each snapshot by default and prints statuses such as:
   -grace 24h
 ```
 
+### 3.7 Print version
+
+```bash
+./backup-engine version
+```
+
 ## 4. Command reference
 
 Operational commands accept these output controls:
@@ -138,17 +166,20 @@ Operational commands accept these output controls:
 
 Interactive terminals show detailed summaries by default. Redirected output remains concise unless `-verbose` is supplied. Progress and advisory messages are written to stderr; primary results are written to stdout.
 
-Every command that opens a repository (`init`, `backup`, `restore`, `list-snapshots`, `snapshot`, `gc`, `verify`, `doctor`) also accepts storage backend flags:
+Every command that opens a repository (`init`, `backup`, `restore`, `list-snapshots`, `snapshot`, `gc`, `verify`, `doctor`, `scrub`) also accepts storage backend flags:
 - `-storage-backend`: `local` (default) or `minio` for an S3-compatible bucket.
 - `-s3-endpoint`, `-s3-bucket`, `-s3-prefix`: MinIO/S3 connection target (endpoint and bucket are required when `-storage-backend minio`).
 - `-s3-access-key`, `-s3-secret-key`: credentials; fall back to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` when omitted.
 - `-s3-use-ssl`: defaults to `true`.
+- `-s3-object-lock-days`: if > 0, request S3 Object Lock retention (in days) on every uploaded pack; the bucket must already have Object Lock enabled at creation time.
+- `-s3-object-lock-compliance`: use irreversible COMPLIANCE mode instead of GOVERNANCE mode for Object Lock retention.
 
 The bbolt index (chunk mappings, snapshot envelopes, key-check metadata, lifecycle) always stays local under `<repo>/index`; only packfiles move to the configured backend. Use the same storage flags on every command against a given repository.
 
 ### init
-- Required: `-repo`, `-passphrase`, `-salt`
+- Required: `-repo`, `-passphrase`, `-salt` (or `-passphrase-file`/`-salt-file` or env vars)
 - Optional: `-bind-existing` for existing repositories without key-check metadata
+- Optional: `-s3-object-lock-days`, `-s3-object-lock-compliance` for S3 Object Lock retention
 
 ### tui
 - Starts the full-screen terminal interface:
@@ -160,11 +191,11 @@ The bbolt index (chunk mappings, snapshot envelopes, key-check metadata, lifecyc
 Running `./backup-engine` without a subcommand also opens the TUI when stdin and stdout are interactive terminals. Non-interactive invocations continue to print command help instead of waiting for input.
 
 ### backup
-- Required: `-repo`, `-source`, `-passphrase`, `-salt`
+- Required: `-repo`, `-source`, `-passphrase`, `-salt` (or file/env alternatives)
 - Optional: `-tags` (comma-separated, default `DAILY`)
 
 ### list-snapshots
-- Required: `-repo`, `-passphrase`, `-salt`
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
 - Optional: `-validate` default `true`
 
 ### snapshot
@@ -181,22 +212,46 @@ Snapshot lifecycle actions use `backup-engine snapshot <action>`:
 Trash is reversible until its purge date and does not immediately reclaim space. Garbage collection reclaims unshared chunks only after the recovery window expires. `remove` skips this entirely: it is irreversible but frees destination space right away.
 
 ### restore
-- Required: `-repo`, `-snapshot`, `-dest`, `-passphrase`, `-salt`
+- Required: `-repo`, `-snapshot`, `-dest`, `-passphrase`, `-salt` (or file/env alternatives)
 
 ### verify
-- Required: `-repo`, `-passphrase`, `-salt`
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
 
 ### doctor
-- Required: `-repo`, `-passphrase`, `-salt`
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
+
+### scrub
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
+- Re-validates every packfile's BLAKE3 trailer checksum without decrypting anything, catching bit-rot on data at rest (including packs no live snapshot currently references).
 
 ### gc
-- Required: `-repo`, `-passphrase`, `-salt`
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
 - Optional:
   - `-keep-daily` default `7`
   - `-keep-weekly` default `4`
   - `-keep-monthly` default `12`
   - `-keep-yearly` default `3`
   - `-grace` default `24h`
+
+### version
+- Prints the build version (set via `-ldflags -X main.version=...` at build time)
+
+### replicate
+- `backup-engine replicate run` copies packfiles, encrypted snapshot manifests, and the CID directory from the repository's own storage backend to a second, offsite backend. Idempotent: re-running skips items already present at the remote.
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives), `-remote-storage-backend minio`, `-remote-s3-endpoint`, `-remote-s3-bucket`
+- Optional: `-remote-s3-prefix`, `-remote-s3-access-key`/`-remote-s3-secret-key` (fall back to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), `-remote-s3-use-ssl`, `-remote-s3-object-lock-days`, `-remote-s3-object-lock-compliance`
+- The remote backend must not be `local`. Packs, manifests, and the CID directory are replicated under separate `packs`/`manifests`/`index` sub-prefixes so they cannot collide.
+
+### recover
+- `backup-engine recover` rebuilds a fresh, empty repository directory entirely from a remote populated by a prior `replicate run`: encrypted snapshot manifests, the chunk-location index (parsed directly from each remote pack's own trailer, no decryption needed), and the pack contents themselves.
+- Required: `-repo` (must be empty/uninitialized), `-passphrase`, `-salt` (or file/env alternatives), `-remote-storage-backend minio`, `-remote-s3-endpoint`, `-remote-s3-bucket`
+- Optional: `-remote-s3-prefix`, `-remote-s3-access-key`/`-remote-s3-secret-key`, `-remote-s3-use-ssl`
+- **Important:** a chunk's decryption key is derived from its CID, and StorageID cannot be turned back into a CID without decrypting the chunk — a circular, impossible requirement. `recover` can only make data readable again if the remote also has the encrypted CID directory pushed by `replicate run`. A repository replicated with an older build needs one more `replicate run` after upgrading; otherwise `recover` will rebuild the snapshot/chunk-location structure but every chunk will remain permanently undecryptable. `recover` reports whether the CID directory was found and runs a full `verify` at the end so this is never silent.
+
+### history
+- `backup-engine history list` prints persisted, encrypted transaction history entries (newest first) for every operation type, including status, duration, and (on failure) the error message. `-limit` bounds how many entries are returned (default 50, `0` for all).
+- `backup-engine history clear -before <RFC3339>` permanently deletes entries completed before the given timestamp.
+- Required: `-repo`, `-passphrase`, `-salt` (or file/env alternatives)
 
 ### replicate
 - `backup-engine replicate run` copies packfiles and encrypted snapshot manifests from the
@@ -237,8 +292,11 @@ Main sections:
 6. `Snapshots`: readable-status catalog with filtering and direct restore handoff.
 7. `History`: persistent, encrypted transaction history across sessions (backup/restore/gc/verify/doctor/replicate/remove/init).
 8. `Health`: verify stored data and run doctor consistency checks.
-9. `Retention`: review GFS policy and run garbage collection.
-10. `Setup`: initialize key-check metadata or bind an existing repository.
+9. `Scrub`: re-validate every packfile's checksum for bit-rot without decrypting.
+10. `Retention`: review GFS policy and run garbage collection.
+11. `Replicate`: copy packs, manifests, and the CID directory to an offsite backend.
+12. `Recover`: rebuild this repository path entirely from an offsite replica after total local loss.
+13. `Setup`: initialize key-check metadata or bind an existing repository.
 
 Key controls:
 - `up`/`down` or `k`/`j`: navigate.
@@ -281,22 +339,26 @@ Do not use rsync against a live repository. It cannot create a consistent checkp
 
 ## 8. Current limitations
 
-- The MinIO/S3 backend must be configured consistently across all commands for a given repository; there is no automatic multi-backend replication yet.
-- Cloud immutability policy automation (Object Lock lifecycle workflow) is not yet fully wired.
-- Replication (`replicate run`) is one-shot/on-demand, not a scheduled background daemon; run it yourself on a schedule (e.g. cron) if continuous offsite sync is required.
-- Large-repository performance tuning and extensive chaos scenarios are still evolving.
+- Linux-only for now: xattr capture, repository locking, and symlink mtime preservation all use `golang.org/x/sys/unix`. macOS/Windows support is not planned unless separately requested.
+- `replicate`/`scrub` are one-shot commands meant to be invoked manually or via cron/systemd timers, not always-on daemons; there is no in-process scheduler.
+- There is no passphrase/salt rotation. Because the encryption key hierarchy is entirely passphrase-derived, rotating either would require re-encrypting the whole repository; this is not currently supported.
+- S3 Object Lock retention is opt-in per replicate/init call (`-s3-object-lock-days`); it is not automatically derived from a repository's GFS retention policy, and bucket lifecycle policy automation is not implemented.
+- Backup, GC, initialization, and lifecycle mutations use a one-writer repository lock.
 
 ## 9. Recommended workflow for now
 
-1. Initialize repository: `init`.
-2. Run backups on schedule.
+1. Initialize repository: `init` (optionally with `-s3-object-lock-days` for WORM retention).
+2. Run backups on schedule (use `-passphrase-file`/`-salt-file` or env vars for credentials).
 3. Validate with `list-snapshots` and `verify`.
 4. Use `doctor` periodically for consistency checks.
-5. Apply retention with `gc` in maintenance windows.
+5. Run `scrub` periodically to detect bit-rot on data at rest.
+6. Apply retention with `gc` in maintenance windows.
+7. Run `replicate run` on schedule to maintain an offsite copy with the CID directory for disaster recovery.
 
 ## 10. Next usability improvements to consider
 
 1. Config file support (`backup-engine.yaml`) for repo defaults.
-2. Passphrase file or environment variable support (`-passphrase-file`, `BACKUP_ENGINE_PASSPHRASE`).
+2. Passphrase rotation support (requires key-hierarchy redesign).
+3. Automatic Object Lock retention derived from GFS policy.
 3. Persisted TUI theme and safety-profile preferences.
 3. GC dry-run mode to preview deletions before mutation.

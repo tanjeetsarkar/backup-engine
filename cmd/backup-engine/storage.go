@@ -10,13 +10,15 @@ import (
 
 // storageOptions binds CLI flags for selecting and configuring a repository's pack storage backend.
 type storageOptions struct {
-	backend   *string
-	endpoint  *string
-	bucket    *string
-	prefix    *string
-	accessKey *string
-	secretKey *string
-	useSSL    *bool
+	backend              *string
+	endpoint             *string
+	bucket               *string
+	prefix               *string
+	accessKey            *string
+	secretKey            *string
+	useSSL               *bool
+	objectLockDays       *int
+	objectLockCompliance *bool
 }
 
 func bindStorageOptions(flags *flag.FlagSet) *storageOptions {
@@ -32,13 +34,15 @@ func bindRemoteStorageOptions(flags *flag.FlagSet) *storageOptions {
 
 func bindPrefixedStorageOptions(flags *flag.FlagSet, prefix string) *storageOptions {
 	return &storageOptions{
-		backend:   flags.String(prefix+"storage-backend", "local", "pack storage backend: local or minio (s3-compatible)"),
-		endpoint:  flags.String(prefix+"s3-endpoint", "", "minio/s3 endpoint host:port (required for -storage-backend minio)"),
-		bucket:    flags.String(prefix+"s3-bucket", "", "minio/s3 bucket name (required for -storage-backend minio)"),
-		prefix:    flags.String(prefix+"s3-prefix", "", "optional object key prefix within the bucket"),
-		accessKey: flags.String(prefix+"s3-access-key", "", "minio/s3 access key (falls back to AWS_ACCESS_KEY_ID)"),
-		secretKey: flags.String(prefix+"s3-secret-key", "", "minio/s3 secret key (falls back to AWS_SECRET_ACCESS_KEY)"),
-		useSSL:    flags.Bool(prefix+"s3-use-ssl", true, "use TLS when connecting to the minio/s3 endpoint"),
+		backend:              flags.String(prefix+"storage-backend", "local", "pack storage backend: local or minio (s3-compatible)"),
+		endpoint:             flags.String(prefix+"s3-endpoint", "", "minio/s3 endpoint host:port (required for -storage-backend minio)"),
+		bucket:               flags.String(prefix+"s3-bucket", "", "minio/s3 bucket name (required for -storage-backend minio)"),
+		prefix:               flags.String(prefix+"s3-prefix", "", "optional object key prefix within the bucket"),
+		accessKey:            flags.String(prefix+"s3-access-key", "", "minio/s3 access key (falls back to AWS_ACCESS_KEY_ID)"),
+		secretKey:            flags.String(prefix+"s3-secret-key", "", "minio/s3 secret key (falls back to AWS_SECRET_ACCESS_KEY)"),
+		useSSL:               flags.Bool(prefix+"s3-use-ssl", true, "use TLS when connecting to the minio/s3 endpoint"),
+		objectLockDays:       flags.Int(prefix+"s3-object-lock-days", 0, "if > 0, request S3 Object Lock retention (in days) on every uploaded pack; the bucket must already have Object Lock enabled"),
+		objectLockCompliance: flags.Bool(prefix+"s3-object-lock-compliance", false, "use irreversible COMPLIANCE mode instead of GOVERNANCE mode for Object Lock retention"),
 	}
 }
 
@@ -52,13 +56,15 @@ func (o *storageOptions) config() pipeline.StorageConfig {
 		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
 	}
 	return pipeline.StorageConfig{
-		Backend:   pipeline.StorageBackend(*o.backend),
-		Endpoint:  *o.endpoint,
-		Bucket:    *o.bucket,
-		Prefix:    *o.prefix,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-		UseSSL:    *o.useSSL,
+		Backend:                 pipeline.StorageBackend(*o.backend),
+		Endpoint:                *o.endpoint,
+		Bucket:                  *o.bucket,
+		Prefix:                  *o.prefix,
+		AccessKey:               accessKey,
+		SecretKey:               secretKey,
+		UseSSL:                  *o.useSSL,
+		ObjectLockRetentionDays: *o.objectLockDays,
+		ObjectLockCompliance:    *o.objectLockCompliance,
 	}
 }
 

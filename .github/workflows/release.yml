@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          for goarch in amd64 arm64; do
+            out="dist/backup-engine-linux-${goarch}"
+            GOOS=linux GOARCH="${goarch}" go build -trimpath \
+              -ldflags "-s -w -X main.version=${tag}" \
+              -o "${out}" ./cmd/backup-engine
+          done
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum backup-engine-linux-amd64 backup-engine-linux-arm64 > checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/backup-engine-linux-amd64
+            dist/backup-engine-linux-arm64
+            dist/checksums.txt

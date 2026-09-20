@@ -45,6 +45,26 @@ func runAction(ctx context.Context, repository repositoryContext, form actionFor
 				bind := strings.EqualFold(values[0], "yes") || strings.EqualFold(values[0], "y")
 				result, err := pipeline.InitRepositoryDetailed(pipeline.InitConfig{RepoDir: expandHome(repository.repo), Passphrase: []byte(repository.passphrase), Salt: []byte(repository.salt), BindExisting: bind}, reporter)
 				return taskResultMsg{title: "Repository initialization", detail: "Repository initialized and key-check metadata written.", summary: []string{"Key-check metadata  ready", fmt.Sprintf("Bound existing data  %t", result.BoundExisting), fmt.Sprintf("Duration             %s", result.Duration.Round(time.Millisecond))}, next: "Connect the repository, then create a backup.", err: err}
+			case actionRecover:
+				result, err := pipeline.RecoverFromRemoteDetailed(ctx, pipeline.RecoverConfig{
+					RepoDir:    expandHome(repository.repo),
+					Passphrase: []byte(repository.passphrase),
+					Salt:       []byte(repository.salt),
+					Remote:     remoteStorageConfigFromValues(values),
+				}, reporter)
+				cidNote := "CID directory found; content is fully recoverable."
+				if !result.CIDDirectoryFound {
+					cidNote = "No remote CID directory found; chunks remain undecryptable until a full rebuild from original sources."
+				}
+				return taskResultMsg{title: "Recovery transaction", detail: cidNote, summary: []string{
+					fmt.Sprintf("Manifests recovered   %d", result.ManifestsRecovered),
+					fmt.Sprintf("Packs scanned         %d", result.PacksScanned),
+					fmt.Sprintf("Chunk locations       %d", result.ChunkLocations),
+					fmt.Sprintf("CID directory found   %t", result.CIDDirectoryFound),
+					fmt.Sprintf("CIDs recovered        %d", result.CIDsRecovered),
+					fmt.Sprintf("Snapshots verified    %d", result.Verify.SnapshotsChecked),
+					fmt.Sprintf("Duration              %s", result.Duration.Round(time.Millisecond)),
+				}, next: "Open Snapshots to confirm the recovered catalog looks complete.", warning: !result.CIDDirectoryFound, err: err}
 			}
 
 			engine, err := openRepository(repository)
@@ -96,6 +116,14 @@ func runAction(ctx context.Context, repository repositoryContext, form actionFor
 					fmt.Sprintf("Chunks purged       %d", result.ChunksPurged),
 					fmt.Sprintf("Duration            %s", result.Duration.Round(time.Millisecond)),
 				}, next: "Run Health after garbage collection to verify repository consistency.", err: err}
+			case actionReplicate:
+				result, err := engine.ReplicateDetailed(ctx, remoteStorageConfigFromValues(values), reporter)
+				return taskResultMsg{title: "Replication transaction", detail: "Packs, manifests, and the CID directory were copied to the remote.", summary: []string{
+					fmt.Sprintf("Packs replicated/skipped     %d / %d", result.Packs.ItemsReplicated, result.Packs.ItemsSkipped),
+					fmt.Sprintf("Manifests replicated/skipped %d / %d", result.Manifests.ItemsReplicated, result.Manifests.ItemsSkipped),
+					fmt.Sprintf("CIDs replicated              %d", result.CIDsReplicated),
+					fmt.Sprintf("Duration                     %s", result.Duration.Round(time.Millisecond)),
+				}, next: "This offsite copy is now usable by Recover if the local repository is ever lost.", err: err}
 			default:
 				return taskResultMsg{title: "Unsupported action", err: fmt.Errorf("unsupported action")}
 			}
@@ -213,6 +241,48 @@ func runHealth(ctx context.Context, repository repositoryContext, events chan te
 				fmt.Sprintf("Issues found          %d", len(result.Issues)),
 				fmt.Sprintf("Duration              %s", result.Duration.Round(time.Millisecond)),
 			}, next: "Review reported issues before running retention or deleting repository copies.", warning: warning, err: err}
+		}()
+		events <- resultMessage
+		return nil
+	}
+}
+
+// remoteStorageConfigFromValues parses the shared remote-target fields used by the Replicate and
+// Recover forms (backend, endpoint, bucket, prefix, access key, secret key, use TLS) in that order.
+func remoteStorageConfigFromValues(values []string) pipeline.StorageConfig {
+	useTLS := !(strings.EqualFold(values[6], "no") || strings.EqualFold(values[6], "n"))
+	return pipeline.StorageConfig{
+		Backend:   pipeline.StorageBackend(strings.ToLower(values[0])),
+		Endpoint:  values[1],
+		Bucket:    values[2],
+		Prefix:    values[3],
+		AccessKey: values[4],
+		SecretKey: values[5],
+		UseSSL:    useTLS,
+	}
+}
+
+func runScrub(ctx context.Context, repository repositoryContext, events chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		defer close(events)
+		reporter := func(event pipeline.ProgressEvent) { events <- progressEventMsg{event: event} }
+		resultMessage := func() taskResultMsg {
+			engine, err := openRepository(repository)
+			if err != nil {
+				return taskResultMsg{title: "Scrub failed", err: err}
+			}
+			defer engine.Close()
+			result, err := engine.ScrubDetailed(ctx, reporter)
+			warning := result.PacksCorrupt > 0
+			detail := "No bit-rot detected in any stored packfile."
+			if warning {
+				detail = fmt.Sprintf("%d packfile(s) failed their checksum; see issues below.", result.PacksCorrupt)
+			}
+			return taskResultMsg{title: "Scrub transaction", detail: detail, summary: []string{
+				fmt.Sprintf("Packs scanned %d", result.PacksScanned),
+				fmt.Sprintf("Packs corrupt %d", result.PacksCorrupt),
+				fmt.Sprintf("Duration      %s", result.Duration.Round(time.Millisecond)),
+			}, next: "Restore any corrupt pack from a replicated copy before it is needed for a restore.", warning: warning, err: err}
 		}()
 		events <- resultMessage
 		return nil

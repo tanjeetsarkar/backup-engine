@@ -47,6 +47,7 @@ type Engine struct {
 	packTargetSize int
 	compressor     *zstd.Encoder
 	decompressor   *zstd.Decoder
+	dedupFilter    *bloomFilter
 }
 
 // SnapshotStatus reports whether a snapshot metadata envelope is decryptable.
@@ -120,6 +121,16 @@ func Open(cfg EngineConfig) (*Engine, error) {
 		return nil, fmt.Errorf("create zstd decoder: %w", err)
 	}
 
+	// Built once from the existing dedup directory so backupOneFile can skip the bbolt read on a
+	// definite miss; a repository-open cost proportional to distinct chunk count, not per backup.
+	dedupFilter, err := buildDedupFilter(idx)
+	if err != nil {
+		enc.Close()
+		dec.Close()
+		_ = idx.Close()
+		return nil, fmt.Errorf("build dedup filter: %w", err)
+	}
+
 	return &Engine{
 		repoDir:        cfg.RepoDir,
 		idx:            idx,
@@ -128,6 +139,7 @@ func Open(cfg EngineConfig) (*Engine, error) {
 		packTargetSize: cfg.PackTargetSize,
 		compressor:     enc,
 		decompressor:   dec,
+		dedupFilter:    dedupFilter,
 	}, nil
 }
 
@@ -660,18 +672,22 @@ func (e *Engine) backupOneFile(
 			continue
 		}
 
-		sid, found, err := e.idx.GetStorageID(cid)
-		if err != nil {
-			return nil, pending, err
-		}
-		if found {
-			result.ChunksReused++
-			cache[cid] = sid
-			storageIDs = append(storageIDs, sid)
-			continue
+		if e.dedupFilter != nil && !e.dedupFilter.MightContain(cid) {
+			// Definite miss: skip the bbolt read below and go straight to treating this as new.
+		} else {
+			sid, found, err := e.idx.GetStorageID(cid)
+			if err != nil {
+				return nil, pending, err
+			}
+			if found {
+				result.ChunksReused++
+				cache[cid] = sid
+				storageIDs = append(storageIDs, sid)
+				continue
+			}
 		}
 
-		sid = e.km.DeriveStorageID(cid)
+		sid := e.km.DeriveStorageID(cid)
 		chunkKey := e.km.DeriveChunkKey(cid)
 
 		compressed := e.compressor.EncodeAll(piece.Data, nil)
@@ -688,6 +704,9 @@ func (e *Engine) backupOneFile(
 		result.ChunksNew++
 		cache[cid] = sid
 		storageIDs = append(storageIDs, sid)
+		if e.dedupFilter != nil {
+			e.dedupFilter.Add(cid)
+		}
 	}
 
 	var contentHash [32]byte

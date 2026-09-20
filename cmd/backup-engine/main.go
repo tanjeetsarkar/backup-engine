@@ -60,6 +60,16 @@ func main() {
 			printOperationError(err)
 			os.Exit(1)
 		}
+	case "recover":
+		if err := runRecover(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
+	case "scrub":
+		if err := runScrub(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
 	case "history":
 		if err := runHistory(os.Args[2:]); err != nil {
 			printOperationError(err)
@@ -85,6 +95,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "tui failed:", err)
 			os.Exit(1)
 		}
+	case "version":
+		if err := runVersion(os.Args[2:]); err != nil {
+			printOperationError(err)
+			os.Exit(1)
+		}
 	default:
 		printUsage()
 		os.Exit(2)
@@ -97,21 +112,28 @@ func runBackup(args []string) error {
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
 	source := fs.String("source", "", "source file or directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	tags := fs.String("tags", "DAILY", "comma-separated retention tags")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -149,8 +171,7 @@ func runRestore(args []string) error {
 	repo := fs.String("repo", "", "repository directory")
 	dest := fs.String("dest", "", "restore destination root")
 	snapshot := fs.String("snapshot", "", "snapshot id (hex)")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -160,14 +181,22 @@ func runRestore(args []string) error {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -199,21 +228,28 @@ func runListSnapshots(args []string) error {
 	output := bindOutputOptions(fs)
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	validate := fs.Bool("validate", true, "validate snapshot readability with current key")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -264,8 +300,7 @@ func runGC(args []string) error {
 	output := bindOutputOptions(fs)
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	keepDaily := fs.Int("keep-daily", 7, "retain daily snapshots")
 	keepWeekly := fs.Int("keep-weekly", 4, "retain weekly snapshots")
 	keepMonthly := fs.Int("keep-monthly", 12, "retain monthly snapshots")
@@ -280,14 +315,22 @@ func runGC(args []string) error {
 		return fmt.Errorf("invalid grace duration: %w", err)
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -326,20 +369,27 @@ func runVerify(args []string) error {
 	output := bindOutputOptions(fs)
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -373,20 +423,27 @@ func runDoctor(args []string) error {
 	output := bindOutputOptions(fs)
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
 	eng, err := pipeline.Open(pipeline.EngineConfig{
 		RepoDir:    *repo,
-		Passphrase: []byte(*passphrase),
-		Salt:       []byte(*salt),
+		Passphrase: passphrase,
+		Salt:       salt,
 		Storage:    storage,
 	})
 	if err != nil {
@@ -432,21 +489,31 @@ func runInit(args []string) error {
 	output := bindOutputOptions(fs)
 	storageOpts := bindStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	bindExisting := fs.Bool("bind-existing", false, "bind key-check for existing repository data")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
+	if err := pipeline.EnsureObjectLockEnabled(context.Background(), storageOpts.config()); err != nil {
+		return err
+	}
 	result, err := pipeline.InitRepositoryDetailed(pipeline.InitConfig{
 		RepoDir:      *repo,
-		Passphrase:   []byte(*passphrase),
-		Salt:         []byte(*salt),
+		Passphrase:   passphrase,
+		Salt:         salt,
 		BindExisting: *bindExisting,
 		Storage:      storage,
 	}, output.reporter())
@@ -495,9 +562,11 @@ func splitTags(raw string) []string {
 
 func printUsage() {
 	fmt.Println("backup-engine <command> [flags]")
-	fmt.Println("commands: init, tui, backup, restore, list-snapshots, snapshot, gc, replicate, history, verify, doctor")
+	fmt.Println("commands: init, tui, backup, restore, list-snapshots, snapshot, gc, replicate, recover, scrub, history, verify, doctor, version")
 	fmt.Println("snapshot: backup-engine snapshot <list|show|trash|untrash|pin|unpin|remove|edit> [flags]")
 	fmt.Println("replicate: backup-engine replicate run -repo /repo -passphrase secret -salt 0123456789abcdef -remote-storage-backend minio -remote-s3-endpoint host:9000 -remote-s3-bucket offsite")
+	fmt.Println("recover: backup-engine recover -repo /fresh-repo -passphrase secret -salt 0123456789abcdef -remote-storage-backend minio -remote-s3-endpoint host:9000 -remote-s3-bucket offsite")
+	fmt.Println("scrub: backup-engine scrub -repo /repo -passphrase secret -salt 0123456789abcdef")
 	fmt.Println("history: backup-engine history <list|clear> -repo /repo -passphrase secret -salt 0123456789abcdef")
 	fmt.Println("init: backup-engine init -repo /repo -passphrase secret -salt 0123456789abcdef")
 	fmt.Println("tui:  backup-engine tui")

@@ -199,6 +199,35 @@ func (d *DB) PutCID(cid, storageID [32]byte) error {
 	})
 }
 
+// CIDMapping couples a CID with its blinded StorageID.
+type CIDMapping struct {
+	CID       [32]byte
+	StorageID [32]byte
+}
+
+// ListCIDMappings returns every known CID -> StorageID mapping in the index.
+func (d *DB) ListCIDMappings() ([]CIDMapping, error) {
+	var mappings []CIDMapping
+	err := d.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketCIDs)
+		if b == nil {
+			return fmt.Errorf("missing bucket %q", string(bucketCIDs))
+		}
+		c := b.Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if len(k) != 32 || len(v) != 32 {
+				continue
+			}
+			var mapping CIDMapping
+			copy(mapping.CID[:], k)
+			copy(mapping.StorageID[:], v)
+			mappings = append(mappings, mapping)
+		}
+		return nil
+	})
+	return mappings, err
+}
+
 // GetStorageID reads the StorageID for a CID.
 func (d *DB) GetStorageID(cid [32]byte) (storageID [32]byte, found bool, err error) {
 	err = d.db.View(func(tx *bolt.Tx) error {

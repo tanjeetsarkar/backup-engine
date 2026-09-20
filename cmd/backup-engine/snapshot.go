@@ -20,8 +20,7 @@ func runSnapshot(args []string) error {
 	output := bindOutputOptions(flags)
 	storageOpts := bindStorageOptions(flags)
 	repo := flags.String("repo", "", "repository directory")
-	passphrase := flags.String("passphrase", "", "repository passphrase")
-	salt := flags.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(flags)
 	idValue := flags.String("id", "", "snapshot id (hex)")
 	includeTrash := flags.Bool("include-trash", false, "include recoverably trashed snapshots")
 	trashFor := flags.String("trash-for", "168h", "recovery window before trashed snapshot becomes purgeable")
@@ -36,11 +35,19 @@ func runSnapshot(args []string) error {
 	provided := make(map[string]bool)
 	flags.Visit(func(current *flag.Flag) { provided[current.Name] = true })
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
-	engine, err := pipeline.Open(pipeline.EngineConfig{RepoDir: *repo, Passphrase: []byte(*passphrase), Salt: []byte(*salt), Storage: storage})
+	engine, err := pipeline.Open(pipeline.EngineConfig{RepoDir: *repo, Passphrase: passphrase, Salt: salt, Storage: storage})
 	if err != nil {
 		return err
 	}

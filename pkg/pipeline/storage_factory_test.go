@@ -44,6 +44,15 @@ func TestNewStorageEngineUnknownBackend(t *testing.T) {
 	}
 }
 
+func TestEnsureObjectLockEnabledNoOpForLocalOrDisabled(t *testing.T) {
+	if err := EnsureObjectLockEnabled(context.Background(), StorageConfig{}); err != nil {
+		t.Fatalf("expected no-op for local backend, got %v", err)
+	}
+	if err := EnsureObjectLockEnabled(context.Background(), StorageConfig{Backend: StorageBackendMinIO}); err != nil {
+		t.Fatalf("expected no-op when ObjectLockRetentionDays is unset, got %v", err)
+	}
+}
+
 // fakeRemoteStorage is a minimal in-memory pack.StorageEngine standing in for a remote backend
 // (e.g. MinIO) so backup/restore can be exercised end-to-end without a running server.
 type fakeRemoteStorage struct {

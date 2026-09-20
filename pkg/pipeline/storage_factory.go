@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 
@@ -28,6 +29,12 @@ type StorageConfig struct {
 	AccessKey string
 	SecretKey string
 	UseSSL    bool
+	// ObjectLockRetentionDays, when > 0 and Backend is minio, requests S3 Object Lock retention on
+	// every uploaded pack. The bucket must already have Object Lock enabled at creation time.
+	ObjectLockRetentionDays int
+	// ObjectLockCompliance selects the irreversible COMPLIANCE mode instead of the default
+	// GOVERNANCE mode when ObjectLockRetentionDays > 0.
+	ObjectLockCompliance bool
 }
 
 // NewStorageEngine builds the pack.StorageEngine described by cfg. repoDir is only used by the
@@ -66,5 +73,32 @@ func newMinIOStorageEngine(cfg StorageConfig) (pack.StorageEngine, error) {
 		return nil, fmt.Errorf("create minio client: %w", err)
 	}
 
-	return miniostorage.New(client, cfg.Bucket, cfg.Prefix)
+	storage, err := miniostorage.New(client, cfg.Bucket, cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ObjectLockRetentionDays > 0 {
+		storage.SetObjectLockRetention(cfg.ObjectLockRetentionDays, cfg.ObjectLockCompliance)
+	}
+	return storage, nil
+}
+
+// EnsureObjectLockEnabled fails clearly if cfg requests Object Lock retention against a minio/S3
+// bucket that was not created with Object Lock support, since S3 cannot enable it retroactively.
+// It is a no-op for the local backend or when ObjectLockRetentionDays is unset.
+func EnsureObjectLockEnabled(ctx context.Context, cfg StorageConfig) error {
+	if cfg.ObjectLockRetentionDays <= 0 {
+		return nil
+	}
+	engine, err := newMinIOStorageEngine(cfg)
+	if err != nil {
+		return err
+	}
+	checker, ok := engine.(interface {
+		EnsureObjectLockEnabled(context.Context) error
+	})
+	if !ok {
+		return nil
+	}
+	return checker.EnsureObjectLockEnabled(ctx)
 }

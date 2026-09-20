@@ -1,9 +1,6 @@
 # Backup Engine
 
-Backup Engine is an experimental, local-first backup tool written in Go. It creates encrypted, content-defined, deduplicated snapshots and provides both a full-screen terminal interface and scriptable CLI commands.
-
-> [!IMPORTANT]
-> This project is under active development. The local backup, restore, verification, diagnostics, and retention paths are implemented and tested, but production hardening, protobuf manifests, cloud replication, and immutable remote retention are not complete.
+Backup Engine is a local-first backup tool written in Go. It creates encrypted, content-defined, deduplicated snapshots and provides both a full-screen terminal interface and scriptable CLI commands.
 
 ## Features
 
@@ -20,6 +17,11 @@ Backup Engine is an experimental, local-first backup tool written in Go. It crea
 - Bubble Tea terminal interface with path completion and safety profiles
 - Phase progress, operation activity, completion summaries, and recovery guidance
 - Concise, verbose, quiet, and JSON CLI output modes
+- **Credential input via file or environment variable** (`-passphrase-file`, `-salt-file`, `BACKUP_ENGINE_PASSPHRASE`, `BACKUP_ENGINE_SALT`)
+- **S3 Object Lock / WORM retention** (`-s3-object-lock-days`, `-s3-object-lock-compliance`)
+- **Disaster recovery** (`recover` rebuilds a repository from a remote replica)
+- **Bit-rot scrubbing** (`scrub` validates every packfile's checksum without decrypting)
+- **Version introspection** (`version` subcommand)
 
 ## Quick Start
 
@@ -200,6 +202,27 @@ Packfiles can instead be stored in a MinIO or other S3-compatible bucket by addi
 
 `-s3-access-key`/`-s3-secret-key` fall back to the `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` environment variables when omitted. Use the same `-storage-backend`/`-s3-*` flags consistently across every command against a given repository; mixing backends for the same repository will make packs written under one backend invisible to commands using the other.
 
+### S3 Object Lock (immutability)
+
+Adding `-s3-object-lock-days N` (with `-storage-backend minio`) makes every uploaded pack request S3 Object Lock retention for `N` days in GOVERNANCE mode, so it cannot be deleted or overwritten until the retention period elapses, even by a compromised or malicious client holding valid credentials — add `-s3-object-lock-compliance` for the stronger, **irreversible** COMPLIANCE mode, which not even the bucket owner or root credentials can shorten or bypass. Choose COMPLIANCE deliberately; it is not a safe default.
+
+Object Lock is a bucket-creation-time property in S3 and **cannot be enabled on an existing bucket**. Before uploading, `init` and `replicate run` run a preflight check (`GetObjectLockConfig`) and fail with a clear error if `-s3-object-lock-days` is set against a bucket that was not created with Object Lock support:
+
+```bash
+mc mb --with-lock local/backup-engine-offsite   # bucket must be created with Object Lock enabled
+./backup-engine replicate run \
+  -repo /tmp/backup-repo -passphrase "..." -salt "0123456789abcdef" \
+  -remote-storage-backend minio -remote-s3-endpoint offsite-host:9000 -remote-s3-bucket backup-engine-offsite \
+  -remote-s3-access-key "$OFFSITE_ACCESS_KEY" -remote-s3-secret-key "$OFFSITE_SECRET_KEY" \
+  -remote-s3-object-lock-days 30
+```
+
+Large packfiles upload via multipart automatically: the underlying `minio-go` client switches from a single-shot `PutObject` to multipart streaming once an object exceeds its internal part-size threshold (16 MiB by default), with no extra configuration needed here.
+
+## Performance
+
+`pkg/chunker.BenchmarkFastCDCThroughput` and `pkg/pipeline.BenchmarkBackupPathDetailed` are informational (non-failing) benchmarks establishing a baseline for backup throughput; run them with `go test ./pkg/chunker/... -bench BenchmarkFastCDCThroughput -benchmem` (similarly for the pipeline benchmark). `FastCDC.NextChunk` returns chunks that alias its internal buffer instead of copying, cutting allocations from ~1 per emitted chunk to a handful for an entire file — the returned `Chunk.Data` is only valid until the next `NextChunk()` call. A blocked Bloom filter (`pkg/pipeline/bloom.go`), built from the existing CID directory when a repository opens, short-circuits the bbolt dedup lookup for definite-miss (genuinely new) chunks; a possible-hit still falls through to the authoritative bbolt read, so false positives never affect correctness. A CRC32 pack trailer alongside the existing BLAKE3 trailer checksum was considered and explicitly skipped: BLAKE3 already provides strong, cryptographically sound corruption detection, and adding CRC32 would not meaningfully improve on it.
+
 ## Replication
 
 `replicate run` copies a repository's packfiles and encrypted snapshot manifests to a second, offsite storage backend, without touching the primary repository's own backend. It is idempotent: already-replicated items are skipped, so it is safe to run repeatedly (e.g. on a schedule). Packs and manifests are stored under separate `packs`/`manifests` sub-prefixes at the remote so they can never collide.
@@ -218,6 +241,50 @@ Packfiles can instead be stored in a MinIO or other S3-compatible bucket by addi
 
 Use `-remote-*` flags (mirroring the `-storage-backend`/`-s3-*` flags above) to describe the replication target; the repository's own `-storage-backend`/`-s3-*` flags (if any) describe where it is currently reading from. The remote backend must not be `local`. Replication never deletes data at either end, and does not currently throttle bandwidth or set retention/immutability policy on the remote bucket.
 
+Every `replicate run` also pushes a small encrypted "CID directory" (the full StorageID<->CID dedup mapping, sealed with the repository's metadata key) to the remote under its own `index` sub-prefix, overwriting the previous copy. This is required for `recover` (below) to actually restore data, not just list snapshot structure, after total local loss.
+
+## Disaster Recovery
+
+`recover` rebuilds a fresh, empty repository directory entirely from a remote populated by a prior `replicate run`: encrypted snapshot manifests, the chunk-location index (parsed directly from each remote pack's own trailer, no decryption needed), and the pack contents themselves.
+
+```bash
+./backup-engine recover \
+  -repo /tmp/backup-repo-restored \
+  -passphrase "choose-a-strong-passphrase" \
+  -salt "0123456789abcdef" \
+  -remote-storage-backend minio \
+  -remote-s3-endpoint offsite-host:9000 \
+  -remote-s3-bucket backup-engine-offsite \
+  -remote-s3-access-key "$OFFSITE_ACCESS_KEY" \
+  -remote-s3-secret-key "$OFFSITE_SECRET_KEY"
+```
+
+`-repo` must point at an empty or otherwise uninitialized directory; `recover` refuses to run against a repository that already has snapshots or chunk records, to avoid clobbering a live one.
+
+**Important:** a chunk's decryption key is itself derived from its CID (content identifier), and a StorageID cannot be turned back into a CID without decrypting the chunk it names — a circular, impossible requirement. This means `recover` can only make data readable again if the remote also has the encrypted CID directory pushed by `replicate run` (see above). A repository replicated with an older build that predates this feature needs one more `replicate run` after upgrading; otherwise `recover` will rebuild the snapshot/chunk-location structure but every chunk will remain permanently undecryptable. `recover` reports whether the CID directory was found and runs a full `verify` at the end so this is never silent.
+
+`scrub` re-validates every packfile's own BLAKE3 trailer checksum without decrypting anything, so it can catch bit-rot on data at rest (including packs no live snapshot currently references) rather than just the subset `verify` checks:
+
+```bash
+./backup-engine scrub -repo /tmp/backup-repo -passphrase "choose-a-strong-passphrase" -salt "0123456789abcdef"
+```
+
+## Security
+
+**Credential input.** Every command that accepts `-passphrase`/`-salt` also accepts `-passphrase-file`/`-salt-file` (path to a file containing the value, trimmed of surrounding whitespace) and the `BACKUP_ENGINE_PASSPHRASE`/`BACKUP_ENGINE_SALT` environment variables. Precedence is flag > file > environment variable. Prefer the file or environment variable form: a value passed directly as a flag is visible to any local user via shell history and `ps`/`/proc/<pid>/cmdline` for the life of the process. The plain `-passphrase`/`-salt` flags remain supported for backward compatibility and scripting convenience, not because they are recommended.
+
+```bash
+export BACKUP_ENGINE_PASSPHRASE="choose-a-strong-passphrase"
+export BACKUP_ENGINE_SALT="0123456789abcdef"
+./backup-engine backup -repo /tmp/backup-repo -source ~/Documents
+```
+
+**Dependency scanning.** CI runs `govulncheck ./...` on every push and pull request (see `.github/workflows/ci.yml`); a finding fails the build. Remediate by bumping the flagged dependency and re-running the full gate (`gofmt`, `vet`, `build`, `test`, `-race`) before merging.
+
+**Fuzz testing.** The hand-rolled parsers that decode bytes read back from storage (untrusted if storage is ever compromised or simply corrupted) have Go native fuzz tests: `pkg/pack.FuzzParseTailIndex`, `pkg/pack.FuzzDecodeChunkRecord`, `pkg/manifest.FuzzUnmarshalSnapshotWire`, and `pkg/manifest.FuzzUnmarshalSnapshot` (legacy JSON path). Run them locally with, e.g., `go test ./pkg/pack/... -run '^$' -fuzz '^FuzzParseTailIndex$' -fuzztime 30s`.
+
+**No passphrase/salt rotation.** The encryption key hierarchy (see How It Works) derives every key directly from the passphrase and salt via Argon2id. Rotating either changes the convergent chunk-encryption key and the metadata key for every chunk and snapshot already stored, which would require decrypting and re-encrypting the entire repository. This is a known, currently unsupported operation, not an oversight — plan on choosing a passphrase and salt you will not need to change.
+
 ## Commands
 
 | Command | Purpose |
@@ -230,9 +297,12 @@ Use `-remote-*` flags (mirroring the `-storage-backend`/`-s3-*` flags above) to 
 | `snapshot` | List, inspect, trash, restore, pin, remove, or edit snapshot lifecycle metadata |
 | `verify` | Authenticate and reconstruct all referenced data |
 | `doctor` | Check index mappings, pack records, and snapshot data |
+| `scrub` | Re-validate every packfile's trailer checksum for bit-rot, without decrypting |
 | `gc` | Apply GFS retention and remove unreferenced chunks |
-| `replicate` | Copy packfiles and manifests to a second, offsite storage backend |
+| `replicate` | Copy packfiles, manifests, and the CID directory to a second, offsite storage backend |
+| `recover` | Rebuild a fresh local repository entirely from a remote replica |
 | `history` | List or prune the persistent, encrypted transaction history |
+| `version` | Print the build version |
 
 ## Troubleshooting
 
@@ -248,11 +318,11 @@ Use `-remote-*` flags (mirroring the `-storage-backend`/`-s3-*` flags above) to 
 
 ## Current Limitations
 
-- Remote object-lock and lifecycle policy automation are not complete.
+- S3 Object Lock retention is opt-in per replicate/init call (`-s3-object-lock-days`); it is not automatically derived from a repository's GFS retention policy, and bucket lifecycle policy automation is not implemented.
 - Backup, GC, initialization, and lifecycle mutations use a one-writer repository lock.
-- Graceful pre-commit backup cancellation rolls back new mappings and packs. A durable journal cleans interrupted pre-commit backups when the repository reopens; a snapshot committed atomically before cancellation remains a valid snapshot.
-- GC repack now uses a durability journal analogous to the backup journal: an interrupted repack is rolled back to its pre-repack state on reopen, and the next GC run retries it.
-- Large-scale performance and interruption testing remain ongoing.
+- Linux-only for now: xattr capture, repository locking, and symlink mtime preservation all use `golang.org/x/sys/unix`. macOS/Windows support is not planned unless separately requested.
+- `replicate`/`scrub` are one-shot commands meant to be invoked manually or via cron/systemd timers, not always-on daemons; there is no in-process scheduler.
+- There is no passphrase/salt rotation. Because the encryption key hierarchy is entirely passphrase-derived (see Security below), rotating either would require re-encrypting the whole repository; this is not currently supported.
 
 ## Why Not Rsync?
 

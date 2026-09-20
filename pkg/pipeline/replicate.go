@@ -52,6 +52,17 @@ func (e *Engine) ReplicateDetailed(ctx context.Context, remoteCfg StorageConfig,
 		return result, fmt.Errorf("replicate manifests: %w", err)
 	}
 
+	remoteIndex, err := NewStorageEngine("", withSubPrefix(remoteCfg, "index"))
+	if err != nil {
+		return result, fmt.Errorf("configure remote index storage: %w", err)
+	}
+	emit(reporter, ProgressEvent{Operation: OperationReplicate, Phase: PhaseWriting, Level: EventInfo, Message: "Replicating CID directory"})
+	cidCount, err := e.replicateCIDDirectory(ctx, remoteIndex)
+	result.CIDsReplicated = cidCount
+	if err != nil {
+		return result, fmt.Errorf("replicate cid directory: %w", err)
+	}
+
 	emit(reporter, ProgressEvent{Operation: OperationReplicate, Phase: PhaseComplete, Level: EventSuccess, Message: "Replication completed"})
 	return result, nil
 }

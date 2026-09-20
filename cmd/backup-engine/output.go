@@ -161,9 +161,31 @@ func replicationCountsJSON(counts pipeline.ReplicationCounts) map[string]any {
 
 func replicateJSON(result pipeline.ReplicationResult) map[string]any {
 	return map[string]any{
-		"packs":       replicationCountsJSON(result.Packs),
-		"manifests":   replicationCountsJSON(result.Manifests),
-		"duration_ms": result.Duration.Milliseconds(),
+		"packs":           replicationCountsJSON(result.Packs),
+		"manifests":       replicationCountsJSON(result.Manifests),
+		"cids_replicated": result.CIDsReplicated,
+		"duration_ms":     result.Duration.Milliseconds(),
+	}
+}
+
+func recoverJSON(result pipeline.RecoverResult) map[string]any {
+	return map[string]any{
+		"manifests_recovered": result.ManifestsRecovered,
+		"packs_scanned":       result.PacksScanned,
+		"chunk_locations":     result.ChunkLocations,
+		"cid_directory_found": result.CIDDirectoryFound,
+		"cids_recovered":      result.CIDsRecovered,
+		"verify":              verifyJSON(result.Verify),
+		"duration_ms":         result.Duration.Milliseconds(),
+	}
+}
+
+func scrubJSON(result pipeline.ScrubResult) map[string]any {
+	return map[string]any{
+		"packs_scanned": result.PacksScanned,
+		"packs_corrupt": result.PacksCorrupt,
+		"issues":        result.Issues,
+		"duration_ms":   result.Duration.Milliseconds(),
 	}
 }
 

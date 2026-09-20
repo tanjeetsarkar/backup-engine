@@ -14,6 +14,8 @@ const (
 	OperationInit       Operation = "init"
 	OperationHardDelete Operation = "snapshot-remove"
 	OperationReplicate  Operation = "replicate"
+	OperationScrub      Operation = "scrub"
+	OperationRecover    Operation = "recover"
 )
 
 // Phase identifies the current stage of an operation.
@@ -126,6 +128,33 @@ type DoctorResult struct {
 	Duration            time.Duration
 }
 
+// ScrubResult summarizes a bit-rot scan of every stored packfile.
+type ScrubResult struct {
+	PacksScanned int64
+	PacksCorrupt int64
+	Issues       []DoctorIssue
+	Duration     time.Duration
+}
+
+// RecoverResult summarizes rebuilding a local repository from remote pack and manifest storage.
+// It does not rebuild the CID/dedup index: convergent chunk encryption keys are themselves derived
+// from the CID (see pkg/crypto DeriveChunkKey), so a chunk cannot be decrypted, and therefore its
+// CID cannot be recomputed, without already knowing the CID. Deduplication efficiency is restored
+// gradually as new backups touch the same content again (see README "Disaster Recovery").
+type RecoverResult struct {
+	ManifestsRecovered int64
+	PacksScanned       int64
+	ChunkLocations     int64
+	// CIDDirectoryFound reports whether the remote had a replicated CID directory to restore from.
+	// If false, restore/verify will fail for every chunk until a full rebuild from original
+	// sources, since chunk decryption keys are derived from the CID (see pkg/crypto.DeriveChunkKey)
+	// and it cannot be recovered any other way.
+	CIDDirectoryFound bool
+	CIDsRecovered     int64
+	Verify            VerifyResult
+	Duration          time.Duration
+}
+
 // RetentionDecision explains why a snapshot is retained or released.
 type RetentionDecision struct {
 	SnapshotID [32]byte
@@ -164,5 +193,8 @@ type ReplicationCounts struct {
 type ReplicationResult struct {
 	Packs     ReplicationCounts
 	Manifests ReplicationCounts
-	Duration  time.Duration
+	// CIDsReplicated is the number of CID<->StorageID mappings included in the encrypted CID
+	// directory snapshot pushed to the remote (required for disaster recovery; see Engine.Recover).
+	CIDsReplicated int64
+	Duration       time.Duration
 }

@@ -146,8 +146,11 @@ func TestEveryInputHasUserGuidance(t *testing.T) {
 		}
 	}
 
-	for _, kind := range []actionKind{actionBackup, actionRestore, actionGC, actionInit} {
+	for _, kind := range []actionKind{actionBackup, actionRestore, actionGC, actionInit, actionReplicate, actionRecover} {
 		form := newActionForm(kind)
+		if strings.TrimSpace(form.subtitle) == "" {
+			t.Errorf("%q has no subtitle explaining its implications", form.title)
+		}
 		for _, field := range form.fields {
 			if strings.TrimSpace(field.description) == "" {
 				t.Errorf("%q field %q has no description", form.title, field.label)

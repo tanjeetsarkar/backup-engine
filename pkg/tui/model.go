@@ -28,7 +28,10 @@ const (
 	sectionSnapshots
 	sectionHistory
 	sectionHealth
+	sectionScrub
 	sectionRetention
+	sectionReplicate
+	sectionRecover
 	sectionSetup
 )
 
@@ -41,7 +44,10 @@ var sectionNames = []string{
 	"Snapshots",
 	"History",
 	"Health",
+	"Scrub",
 	"Retention",
+	"Replicate",
+	"Recover",
 	"Setup",
 }
 
@@ -372,7 +378,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.form = newContextForm(m.context)
 				m.mode = modeContextForm
 				return m, m.form.Init()
-			case sectionBackup, sectionRestore, sectionRetention, sectionSetup:
+			case sectionBackup, sectionRestore, sectionRetention, sectionSetup, sectionReplicate, sectionRecover:
 				if m.context.repo == "" {
 					m.statusOK = false
 					m.status = "Connect a repository first."
@@ -404,6 +410,18 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.operationCancel = cancel
 				m.beginOperation("Preparing repository health checks", events)
 				return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runHealth(operationContext, m.context, events))
+			case sectionScrub:
+				if m.context.repo == "" {
+					m.active = sectionContext
+					m.statusOK = false
+					m.status = "Connect a repository first."
+					return m, nil
+				}
+				events := make(chan tea.Msg, 64)
+				operationContext, cancel := context.WithCancel(m.ctx)
+				m.operationCancel = cancel
+				m.beginOperation("Preparing packfile scrub", events)
+				return m, tea.Batch(m.spinner.Tick, waitForProgress(events), runScrub(operationContext, m.context, events))
 			case sectionOverview:
 				m.active = sectionContext
 				m.form = newContextForm(m.context)
@@ -641,7 +659,10 @@ func (m model) detailView() string {
 		sectionSnapshots: "Browse, filter, and inspect available snapshots.",
 		sectionHistory:   "Persistent, encrypted record of past operations across sessions.",
 		sectionHealth:    "Verify stored data and diagnose index consistency.",
+		sectionScrub:     "Re-validate every packfile's checksum for bit-rot, without decrypting anything.",
 		sectionRetention: "Apply retention policy and compact unreferenced data.",
+		sectionReplicate: "Copy packs, manifests, and the CID directory to a second, offsite storage backend.",
+		sectionRecover:   "Rebuild this repository path entirely from an offsite replica after total local loss.",
 		sectionSetup:     "Initialize a new repository or bind key-check metadata.",
 	}[m.active]
 	if m.active == sectionActivity {

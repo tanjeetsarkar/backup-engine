@@ -23,17 +23,27 @@ func runReplicate(args []string) error {
 	storageOpts := bindStorageOptions(fs)
 	remoteOpts := bindRemoteStorageOptions(fs)
 	repo := fs.String("repo", "", "repository directory")
-	passphrase := fs.String("passphrase", "", "repository passphrase")
-	salt := fs.String("salt", "", "repository salt (min 16 chars)")
+	creds := bindCredentialOptions(fs)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 
+	passphrase, err := creds.resolvePassphrase()
+	if err != nil {
+		return err
+	}
+	salt, err := creds.resolveSalt()
+	if err != nil {
+		return err
+	}
 	storage, err := storageOpts.resolve(*repo)
 	if err != nil {
 		return err
 	}
-	engine, err := pipeline.Open(pipeline.EngineConfig{RepoDir: *repo, Passphrase: []byte(*passphrase), Salt: []byte(*salt), Storage: storage})
+	if err := pipeline.EnsureObjectLockEnabled(context.Background(), remoteOpts.config()); err != nil {
+		return err
+	}
+	engine, err := pipeline.Open(pipeline.EngineConfig{RepoDir: *repo, Passphrase: passphrase, Salt: salt, Storage: storage})
 	if err != nil {
 		return err
 	}

@@ -54,6 +54,11 @@ func confirmationFor(profile safetyProfile, form actionForm) (string, string) {
 			return "RESTORE", "The destination exists and may contain files with matching names."
 		}
 		return "yes", "The destination exists and may contain files with matching names."
+	case actionRecover:
+		if profile == safetyStrict {
+			return "RECOVER", "The connected path must be empty. Content is only readable again if the remote has a replicated CID directory."
+		}
+		return "yes", "The connected path must be empty. Content is only readable again if the remote has a replicated CID directory."
 	}
 	return "", ""
 }
@@ -88,6 +93,8 @@ func safetyDialogView(selected safetyProfile) string {
 		"Trash snapshot     strict: TRASH    standard: yes  fast: immediate",
 		"Remove snapshot    always requires typed REMOVE (fast: yes) - instant, bypasses trash",
 		"Garbage collection strict/fast: GC  standard: yes",
+		"Recover repository strict: RECOVER  standard/fast: yes - target path must be empty",
+		"Replicate / Scrub  no confirmation - never delete data; replicate copies out, scrub only reads",
 		"Metadata edits     reversible; snapshot contents stay unchanged",
 		"",
 		mutedStyle.Render("up/down choose  enter apply  esc cancel"),

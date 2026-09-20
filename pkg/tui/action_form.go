@@ -18,6 +18,8 @@ const (
 	actionRestore
 	actionGC
 	actionInit
+	actionReplicate
+	actionRecover
 )
 
 type actionField struct {
@@ -25,11 +27,13 @@ type actionField struct {
 	description string
 	input       textinput.Model
 	path        bool
+	optional    bool
 }
 
 type actionForm struct {
 	kind        actionKind
 	title       string
+	subtitle    string
 	fields      []actionField
 	focus       int
 	errorText   string
@@ -46,6 +50,10 @@ func actionForSection(current section) actionKind {
 		return actionGC
 	case sectionSetup:
 		return actionInit
+	case sectionReplicate:
+		return actionReplicate
+	case sectionRecover:
+		return actionRecover
 	default:
 		return actionBackup
 	}
@@ -59,23 +67,42 @@ func newActionForm(kind actionKind) actionForm {
 		input.SetValue(value)
 		return actionField{label: label, description: description, input: input, path: path}
 	}
+	makeOptionalField := func(label, description, placeholder, value string) actionField {
+		field := makeField(label, description, placeholder, value, false)
+		field.optional = true
+		return field
+	}
+	remoteFields := func() []actionField {
+		return []actionField{
+			makeField("Remote backend", "Storage backend for the offsite target. Currently minio (any S3-compatible endpoint).", "minio", "minio", false),
+			makeField("Remote endpoint", "Offsite host:port the S3-compatible API listens on.", "offsite-host:9000", "", false),
+			makeField("Remote bucket", "Bucket on the offsite endpoint that holds packs, manifests, and the CID directory.", "backup-engine-offsite", "", false),
+			makeOptionalField("Remote prefix", "Optional object key prefix within the bucket. Leave blank to use the bucket root.", "", ""),
+			makeField("Remote access key", "Access key for the offsite endpoint.", "access key", "", false),
+			makeField("Remote secret key", "Secret key for the offsite endpoint. Not stored beyond this session.", "secret key", "", false),
+			makeField("Use TLS", "Whether to connect to the offsite endpoint over TLS. Enter yes unless the endpoint is a local/testing instance without TLS.", "yes", "yes", false),
+		}
+	}
 
 	form := actionForm{kind: kind}
 	switch kind {
 	case actionBackup:
 		form.title = "Create backup"
+		form.subtitle = "Reads the source path and writes new encrypted data; it never modifies or deletes the source."
 		form.fields = []actionField{
 			makeField("Source path", "File or directory to snapshot. Directories are scanned recursively; the source itself is never modified. Tab completes paths.", "~/Documents", "", true),
 			makeField("Retention tags", "Comma-separated labels stored with the snapshot, such as DAILY or IMPORTANT. These labels describe the snapshot; current GFS cleanup uses snapshot dates.", "DAILY,IMPORTANT", "DAILY", false),
 		}
 	case actionRestore:
 		form.title = "Restore snapshot"
+		form.subtitle = "Writes decrypted files to the destination; existing files with matching names may be overwritten."
 		form.fields = []actionField{
 			makeField("Snapshot ID", "The snapshot's 64-character hexadecimal identifier. Select a snapshot in the catalog to prefill this value automatically.", "64 character hexadecimal ID", "", false),
 			makeField("Destination path", "Directory where restored files will be written. It is created when needed; matching files inside an existing directory may be replaced.", "~/restore", "", true),
 		}
 	case actionGC:
 		form.title = "Retention and garbage collection"
+		form.subtitle = "Permanently removes chunks no retained snapshot references; this cannot be undone."
 		form.fields = []actionField{
 			makeField("Keep daily", "Number of distinct recent calendar days represented by one retained snapshot. Use 0 to disable the daily tier.", "7", "7", false),
 			makeField("Keep weekly", "Number of distinct recent ISO weeks represented by one retained snapshot. Use 0 to disable the weekly tier.", "4", "4", false),
@@ -85,7 +112,16 @@ func newActionForm(kind actionKind) actionForm {
 		}
 	case actionInit:
 		form.title = "Initialize repository"
+		form.subtitle = "Writes key-check metadata to the connected path; it does not touch unrelated data."
 		form.fields = []actionField{makeField("Bind existing data", "Enter yes only for a repository that already contains data but lacks key-check metadata. Confirm the original credentials first; binding does not prove all old data is readable.", "no", "no", false)}
+	case actionReplicate:
+		form.title = "Replicate to offsite storage"
+		form.subtitle = "Copies packs, manifests, and the encrypted CID directory to the remote; it never deletes data at either end and is safe to repeat."
+		form.fields = remoteFields()
+	case actionRecover:
+		form.title = "Recover from offsite storage"
+		form.subtitle = "Rebuilds the connected repository path entirely from the remote. That path must be empty; content is only readable again if the remote has a replicated CID directory."
+		form.fields = remoteFields()
 	}
 	form.fields[0].input.Focus()
 	return form
@@ -160,6 +196,9 @@ func (f *actionForm) moveFocus(delta int) {
 
 func (f actionForm) validate() error {
 	for _, field := range f.fields {
+		if field.optional {
+			continue
+		}
 		if strings.TrimSpace(field.input.Value()) == "" {
 			return fmt.Errorf("%s is required", strings.ToLower(field.label))
 		}
@@ -184,6 +223,15 @@ func (f actionForm) validate() error {
 		if value != "yes" && value != "no" && value != "y" && value != "n" {
 			return fmt.Errorf("bind existing data must be yes or no")
 		}
+	case actionReplicate, actionRecover:
+		backend := strings.ToLower(f.fields[0].input.Value())
+		if backend != "minio" && backend != "s3" {
+			return fmt.Errorf("remote backend must be minio (or s3)")
+		}
+		useTLS := strings.ToLower(f.fields[6].input.Value())
+		if useTLS != "yes" && useTLS != "no" && useTLS != "y" && useTLS != "n" {
+			return fmt.Errorf("use tls must be yes or no")
+		}
 	}
 	return nil
 }
@@ -197,7 +245,11 @@ func (f actionForm) values() []string {
 }
 
 func (f actionForm) View() string {
-	lines := []string{sectionTitleStyle.Render(f.title), mutedStyle.Render("Review inputs before starting the operation."), ""}
+	subtitle := f.subtitle
+	if subtitle == "" {
+		subtitle = "Review inputs before starting the operation."
+	}
+	lines := []string{sectionTitleStyle.Render(f.title), mutedStyle.Render(subtitle), ""}
 	for index, field := range f.fields {
 		labelStyle := statusLabelStyle
 		marker := "  "
@@ -271,6 +323,19 @@ func (f actionForm) preflightLines() []string {
 		return []string{
 			"Action       Write repository key-check metadata",
 			"Bind data    " + values[0],
+		}
+	case actionReplicate:
+		return []string{
+			"Action       Copy packs, manifests, and CID directory to remote",
+			"Remote       " + values[0] + " @ " + values[1] + "/" + values[2],
+			"Data policy  Never deletes local or remote data; safe to repeat",
+		}
+	case actionRecover:
+		return []string{
+			"Action       Rebuild connected repository path from remote",
+			"Remote       " + values[0] + " @ " + values[1] + "/" + values[2],
+			"Requirement  Connected path must be empty or uninitialized",
+			"Data policy  Full content recovery needs a replicated CID directory",
 		}
 	default:
 		return nil

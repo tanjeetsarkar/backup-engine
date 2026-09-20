@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ var (
 )
 
 const packNonceSize = 24
+const trailerSize = 40
 
 // StorageEngine defines the transport and storage interface for local and cloud tiers.
 type StorageEngine interface {
@@ -213,12 +215,15 @@ func (l *LocalFilesystemStorage) ListPacks(ctx context.Context) ([][32]byte, err
 
 	var results [][32]byte
 	for _, match := range matches {
-		var id [32]byte
 		base := filepath.Base(match)
 		hexStr := base[:len(base)-len(".pack")]
-		if _, err := fmt.Sscanf(hexStr, "%x", &id); err == nil {
-			results = append(results, id)
+		decoded, err := hex.DecodeString(hexStr)
+		if err != nil || len(decoded) != 32 {
+			continue
 		}
+		var id [32]byte
+		copy(id[:], decoded)
+		results = append(results, id)
 	}
 
 	return results, nil

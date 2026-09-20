@@ -7,6 +7,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"time"
 
 	miniosdk "github.com/minio/minio-go/v7"
 )
@@ -16,6 +17,15 @@ type Storage struct {
 	client *miniosdk.Client
 	bucket string
 	prefix string
+
+	// objectLockRetentionDays, when > 0, makes PutPack request S3 Object Lock retention on every
+	// pack it uploads. The bucket must have been created with Object Lock enabled; it cannot be
+	// retrofitted onto an existing bucket.
+	objectLockRetentionDays int
+	// objectLockCompliance selects COMPLIANCE mode (irreversible, even by the bucket owner/root
+	// credentials) instead of the default GOVERNANCE mode (which a privileged, explicit
+	// GovernanceBypass call can still override).
+	objectLockCompliance bool
 }
 
 // New creates a MinIO storage backend.
@@ -34,6 +44,31 @@ func New(client *miniosdk.Client, bucket, prefix string) (*Storage, error) {
 	}, nil
 }
 
+// SetObjectLockRetention configures the S3 Object Lock retention every subsequently uploaded pack
+// requests. retentionDays <= 0 disables it (the default).
+func (s *Storage) SetObjectLockRetention(retentionDays int, compliance bool) {
+	s.objectLockRetentionDays = retentionDays
+	s.objectLockCompliance = compliance
+}
+
+// EnsureObjectLockEnabled fails clearly if Object Lock retention is configured but the bucket
+// itself was not created with Object Lock enabled -- this is an S3-inherent limitation that cannot
+// be retrofitted onto an existing bucket, so it must be surfaced explicitly rather than silently
+// having every future PutPack call fail or (worse) silently not apply retention.
+func (s *Storage) EnsureObjectLockEnabled(ctx context.Context) error {
+	if s.objectLockRetentionDays <= 0 {
+		return nil
+	}
+	enabled, _, _, _, err := s.client.GetObjectLockConfig(ctx, s.bucket)
+	if err != nil {
+		return fmt.Errorf("bucket %q does not have Object Lock enabled (it must be created with Object Lock support; this cannot be enabled retroactively): %w", s.bucket, err)
+	}
+	if !strings.EqualFold(enabled, "Enabled") {
+		return fmt.Errorf("bucket %q does not have Object Lock enabled (it must be created with Object Lock support; this cannot be enabled retroactively)", s.bucket)
+	}
+	return nil
+}
+
 func (s *Storage) objectKey(packID [32]byte) string {
 	name := fmt.Sprintf("%x.pack", packID)
 	if s.prefix == "" {
@@ -43,7 +78,15 @@ func (s *Storage) objectKey(packID [32]byte) string {
 }
 
 func (s *Storage) PutPack(ctx context.Context, packID [32]byte, r io.Reader, size int64) error {
-	_, err := s.client.PutObject(ctx, s.bucket, s.objectKey(packID), r, size, miniosdk.PutObjectOptions{})
+	opts := miniosdk.PutObjectOptions{}
+	if s.objectLockRetentionDays > 0 {
+		opts.Mode = miniosdk.Governance
+		if s.objectLockCompliance {
+			opts.Mode = miniosdk.Compliance
+		}
+		opts.RetainUntilDate = time.Now().UTC().AddDate(0, 0, s.objectLockRetentionDays)
+	}
+	_, err := s.client.PutObject(ctx, s.bucket, s.objectKey(packID), r, size, opts)
 	return err
 }
 

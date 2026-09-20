@@ -41,6 +41,7 @@ type FastCDC struct {
 	bufEnd     int
 	streamPos  int64
 	sourceDone bool
+	chunk      Chunk
 }
 
 // NewFastCDC instantiates an optimized FastCDC chunker.
@@ -52,6 +53,9 @@ func NewFastCDC(r io.Reader) *FastCDC {
 }
 
 // NextChunk cuts and returns the next content-defined chunk.
+//
+// The returned Chunk.Data aliases the chunker's internal buffer and is only valid until the next
+// call to NextChunk; copy it if it must outlive that call.
 func (c *FastCDC) NextChunk() (*Chunk, error) {
 	// Replenish internal buffer if remaining bytes fall below MaxChunkSize.
 	available := c.bufEnd - c.bufStart
@@ -66,34 +70,26 @@ func (c *FastCDC) NextChunk() (*Chunk, error) {
 
 	// Handle remaining tail bytes when stream completes.
 	if available <= MinChunkSize {
-		chunkData := make([]byte, available)
-		copy(chunkData, c.buffer[c.bufStart:c.bufEnd])
+		chunkData := c.buffer[c.bufStart:c.bufEnd]
 		chunkOffset := c.streamPos
 
 		c.streamPos += int64(available)
 		c.bufStart = c.bufEnd
 
-		return &Chunk{
-			Data:   chunkData,
-			Length: available,
-			Offset: chunkOffset,
-		}, nil
+		c.chunk = Chunk{Data: chunkData, Length: available, Offset: chunkOffset}
+		return &c.chunk, nil
 	}
 
 	// Execute FastCDC normalized gear hashing.
 	cutPoint := c.findCutPoint(available)
-	chunkData := make([]byte, cutPoint)
-	copy(chunkData, c.buffer[c.bufStart:c.bufStart+cutPoint])
+	chunkData := c.buffer[c.bufStart : c.bufStart+cutPoint]
 	chunkOffset := c.streamPos
 
 	c.bufStart += cutPoint
 	c.streamPos += int64(cutPoint)
 
-	return &Chunk{
-		Data:   chunkData,
-		Length: cutPoint,
-		Offset: chunkOffset,
-	}, nil
+	c.chunk = Chunk{Data: chunkData, Length: cutPoint, Offset: chunkOffset}
+	return &c.chunk, nil
 }
 
 // findCutPoint determines the chunk boundary using normalized gear hashing.
